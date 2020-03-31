@@ -1,5 +1,7 @@
 import unittest
 import composite_s2gm as s2gm
+# import pandas as pd
+# import numpy as np
 
 
 class TestCompositeS2(unittest.TestCase):
@@ -28,6 +30,12 @@ class TestCompositeS2(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             s2gm.get_mask_value(33, "random", 100)
+
+    # def test_stc_indexes(self):
+    #     p_col = ['b2', 'b3', 'b4', 'b5', 'b6',
+    #              'b7', 'b8', 'b8A', 'b11', 'b12']
+    #     table = np.random.uniform(low=0.01, high=0.99, size=(3, 10))
+    #     calc_pix = pd.DataFrame(table, columns=p_col, dtype='float')
 
 
 if __name__ == "__main__":

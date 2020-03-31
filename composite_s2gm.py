@@ -8,6 +8,7 @@ This code will be used for compositing based on max NDVI
 """
 
 import numpy as np
+from datetime import date, timedelta
 import glob
 import os
 import time
@@ -16,7 +17,7 @@ from rasterio.windows import Window
 import math
 import pandas as pd
 from affine import Affine
-import logging
+# import logging
 # import pickle
 
 
@@ -36,7 +37,7 @@ def round_multiple(nr, x_left, pix):
     Returns
     -------
     float
-        Number that was rounded to the nearest multiple of the pix_lefte.
+        Number that was rounded to the nearest multiple of the x_left.
 
     """
     return pix * round((nr - x_left) / pix) + x_left
@@ -101,7 +102,7 @@ def output_image_extent(src_fps, bbox):
     tif_ext, pix_res, src_all, bnd_num = ([] for _ in range(4))
 
     for idx, fp in src_fps.items():
-        print('Opening raster {}'.format(fp[109:-24]))
+        print('Opening raster {}'.format(fp[109:-20]))
         with rasterio.open(fp) as src:
             src_all.append(src)
             # Read raster properties
@@ -127,7 +128,6 @@ def output_image_extent(src_fps, bbox):
     if bbox:
         for idx, _ in src_fps.items():
             # Get extents of current image
-            # print(tif_ext[idx])
             xmin_img, ymin_img, xmax_img, ymax_img = [a for a in tif_ext[idx]]
 
             # Round bbox to nearest multiple of raster
@@ -139,7 +139,6 @@ def output_image_extent(src_fps, bbox):
             # Check if bbox falls out of image extents (True if it falls out)
             chk_bbox = (xmin_img > xmax_box or ymin_img > ymax_box or
                         xmax_img < xmin_box or ymax_img < ymin_box)
-            # print(chk_bbox)
             if chk_bbox:
                 skip_im.append(idx)
             else:
@@ -249,66 +248,12 @@ def isSnow(one_pixel):
     return s2gm_snow
 
 
-def isCloud(s_pix):
-    # TODO: Unfinished, at the moment it is ignored, but may be used in future
-
-    r_b3b11 = s_pix.b3 / s_pix.b11    # Ratio b3/b11
-    # r_b11b3 = s_pix.b11 / s_pix.b03    # Ratio b3/b11
-    rgb_mean = (s_pix.b2 + s_pix.b3 + s_pix.b4) / 3    # Brightness
-    # Normalised difference between b8 and b11
-    nd_b8b11 = (s_pix.b8 - s_pix.b1) / (s_pix.b8 + s_pix.b11)
-    # tcHaze
-    tc_haze = (-0.8239 * s_pix.b2
-               + 0.0849 * s_pix.b3
-               + 0.4396 * s_pix.b4
-               - 0.0580 * s_pix.b8A
-               + 0.2013 * s_pix.b11
-               - 0.2773 * s_pix.b12)
-    # TCB
-    tcb = (0.3029 * s_pix.b2
-           + 0.2786 * s_pix.b3
-           + 0.4733 * s_pix.b4
-           + 0.5599 * s_pix.b8A
-           + 0.5080 * s_pix.b11
-           + 0.1872 * s_pix.b12
-           )
-    # Normalised difference snow index
-    ndsi = (s_pix.b3 - s_pix.b11) / (s_pix.b3 + s_pix.b11)
-
-    # Test for if it is not snow
-    test_snow = ndsi > 0.7 and not (r_b3b11 > 1 and tcb > 0.36)
-    # Test if it is high probability cloud
-    hpc1 = ((r_b3b11 > 1 and rgb_mean > 0.3)
-            and (tc_haze < -0.1 or (tc_haze > -0.08 and nd_b8b11 < 0.4))
-            )
-    hpc2 = (tc_haze < -0.2)
-    hpc3 = (r_b3b11 > 1 and rgb_mean < 0.3)
-    hpc4 = (tc_haze < -0.055 and rgb_mean > 0.12)
-    hpc5 = (not(r_b3b11 > 1 and rgb_mean < 0.3)
-            and (tc_haze < -0.09 and rgb_mean > 0.12)
-            )
-    test_hpc = hpc1 or hpc2 or hpc3 and hpc4 or hpc5
-    # Test if it is low probability cloud
-    test_lpc = None
-
-    if test_snow:
-        cloud_test = True
-    elif test_hpc:
-        cloud_test = True
-    elif test_lpc:
-        cloud_test = True
-    else:
-        cloud_test = False
-
-    return cloud_test
-
-
-def medoid(calc_pix, dist='euclid'):
+def medoid_s2gm(calc_pix, dist='euclid'):
     s = pd.Series(index=calc_pix.index, dtype='float')
     for ii, rowi in calc_pix.iterrows():
         e_dist = 0
         for ij, rowj in calc_pix.drop([ii]).iterrows():
-            # Calculate euclidian distance
+            # Calculate Euclidian distance
             if dist == 'euclid':
                 e_dist += np.sqrt(((rowj - rowi) ** 2).sum())
             elif dist == 'norm_diff':
@@ -316,15 +261,22 @@ def medoid(calc_pix, dist='euclid'):
                 # abs((xB - xA) / (xB + xA))
                 e_dist += abs((rowj - rowi) / (rowj + rowi)).sum()
             else:
-                print('Error: Unknown distance for MEDOID.')
-                raise Exception
+                raise Exception('Error: Unknown distance for MEDOID.')
         # Update column
         s.loc[ii] = e_dist
 
     return s
 
 
-def stc_s2(calc_pix):
+def stc_indexes(calc_pix):
+    """Calculates indexes required for the STC method.
+
+    Args:
+        calc_pix (DataFrame): Data frame with bands as columns and observations
+        as rows.
+
+    Returns (DataFrame): Data Frame with all indexes.
+    """
     df = pd.DataFrame()
 
     # mNDWI
@@ -350,87 +302,231 @@ def stc_s2(calc_pix):
     return df
 
 
+def stc_s2gm(stc, calc_pix, snow_df):
+    """Returns index of best pixel from STC method.
+
+    The decision logic and thresholds based on S2GM algorithm by Kirches and
+    Brockmann (2019)
+
+    Args:
+        stc (DataFrame): Data Frame containing indexes for STC method
+        calc_pix (DataFrame): Data Frame containing pixels (for cloud test)
+        snow_df (DataFrame): Data Frame with snow test results
+
+    Returns (integer): index of selected best pixel
+
+    """
+    # Index used for snow and cloud tests
+    idx_tcb_min = stc.TCB.idxmin()
+
+    # Set criteria for STC
+    criteria1 = (stc.mNDWI.mean() < -0.55
+                 and stc.NDVI.max() - stc.NDVI.mean() < 0.05)
+    if criteria1:
+        return stc.NDVI.idxmax()
+
+    criteria2 = (stc.NDVI.mean() < -0.3
+                 and stc.mNDWI.mean() - stc.NDVI.min() < 0.05)
+    if criteria2:
+        return stc.mNDWI.idxmax()
+
+    criteria3 = stc.NDVI.mean() > 0.6 and stc.TCB.mean() < 0.45
+    if criteria3:
+        return stc.NDVI.idxmax()
+
+    # If pixel with min(TCB) fails cloud test
+    criteria4 = not stc_cloud_test(calc_pix.loc[idx_tcb_min])
+    if criteria4:
+        return idx_tcb_min
+
+    # If pixel with min(TCB) fails snow test
+    criteria5 = not snow_df[idx_tcb_min]
+    if criteria5:
+        if stc.TCB.min() > 1:
+            return None
+        else:
+            return idx_tcb_min
+
+    criteria6 = stc.NDVI.mean() < -0.2
+    if criteria6:
+        return stc.mNDWI.idxmax()
+
+    criteria7 = stc.TCB.mean() > 0.45
+    if criteria7:
+        return stc.NDVI.idxmin()
+
+    # If non of the above return max(NDVI)
+    return stc.NDVI.idxmax()
+
+
+def stc_cloud_test(s_pix):
+    """Returns true if clouds are detected.
+
+    Based on the isCLoudOrSnow function from S2GM. The functions takes in one
+    pixel and determines whether it was correctly classified as cloud. It checks
+    for three criteria, first if it isn't snow, second if it is cloud with high
+    probability and finally if it is cloud with low probability.
+
+    Args:
+        s_pix (Series): Pandas series containing info for a single pixel.
+
+    Returns (bool): True if clouds, else False
+
+    """
+    r_b3b11 = s_pix.b3 / s_pix.b11    # Ratio b3/b11
+    r_b11b3 = s_pix.b11 / s_pix.b3    # Ratio b3/b11
+    rgb_mean = (s_pix.b2 + s_pix.b3 + s_pix.b4) / 3    # Brightness
+    # Normalised difference between b8 and b11
+    nd_b8b11 = (s_pix.b8 - s_pix.b11) / (s_pix.b8 + s_pix.b11)
+    # tcHaze
+    tc_haze = (-0.8239 * s_pix.b2
+               + 0.0849 * s_pix.b3
+               + 0.4396 * s_pix.b4
+               - 0.0580 * s_pix.b8A
+               + 0.2013 * s_pix.b11
+               - 0.2773 * s_pix.b12)
+    # TCB
+    tcb = (0.3029 * s_pix.b2
+           + 0.2786 * s_pix.b3
+           + 0.4733 * s_pix.b4
+           + 0.5599 * s_pix.b8A
+           + 0.5080 * s_pix.b11
+           + 0.1872 * s_pix.b12
+           )
+    # Normalised difference snow index
+    ndsi = (s_pix.b3 - s_pix.b11) / (s_pix.b3 + s_pix.b11)
+
+    # Test if it is not snow
+    not_snow = ndsi > 0.7 and not(r_b3b11 > 1 and tcb < 0.36)
+    if not_snow:
+        return True
+
+    # Test if it is high probability cloud
+    hpc1 = ((r_b3b11 > 1 and rgb_mean > 0.3)
+            and (tc_haze < -0.1 or (tc_haze > -0.08 and nd_b8b11 < 0.4))
+            )
+    hpc2 = (tc_haze < -0.2)
+    hpc3 = (r_b3b11 > 1 and rgb_mean < 0.3)
+    hpc4 = (tc_haze < -0.055 and rgb_mean > 0.12)
+    hpc5 = (not(r_b3b11 > 1 and rgb_mean < 0.3)
+            and (tc_haze < -0.09 and rgb_mean > 0.12)
+            )
+    hp_cloud = hpc1 or hpc2 or hpc3 and hpc4 or hpc5
+    if not not_snow and hp_cloud:
+        return True
+
+    # Test if it is low probability cloud
+    lpc1 = ((r_b11b3 > 1 and rgb_mean < 0.2)
+            and (tc_haze < -0.1 or (tc_haze < -0.08 and nd_b8b11 < 0.4))
+            )
+    lpc2 = hpc2
+    lpc3a = r_b3b11 > 1
+    lpc3b = rgb_mean < 0.2
+    lpc3c = hpc4
+    lpc3d = not(r_b3b11 > 1 and rgb_mean < 0.2) and (tc_haze < -0.02)
+    lpc3 = lpc3a and lpc3b and lpc3c or lpc3d
+
+    lp_cloud = lpc1 or lpc2 or lpc3
+    if not not_snow and not hp_cloud and lp_cloud:
+        return True
+
+    return False
+
+
 def select_pixel(calc_pix, nok_one, snow_df, medoid_distance):
     if nok_one == 0:
-        # print('No valid pixels')
         sel_pix_idx = None
     elif nok_one == 1:
-        # print('Only one valid pixel')
         sel_pix_idx = calc_pix.index[0]
     elif nok_one < 4:
-        # print(f'Found {nok_one} valid pixels --> STC')
-        stc = stc_s2(calc_pix)
-
-        # Set criteria for STC
-        criteria1 = (stc.mNDWI.mean() < -0.55
-                     and stc.NDVI.max() - stc.NDVI.mean() < 0.05)
-        criteria2 = (stc.NDVI.mean() < -0.3
-                     and stc.mNDWI.mean() - stc.NDVI.min() < 0.05)
-        criteria3 = stc.NDVI.mean() > 0.6 and stc.TCB.mean() < 0.45
-        idx_tcb_min = stc.TCB.idxmin()
-        # criteria4 = not isCloud(calc_pix.loc[idx_tcb_min])
-        criteria4 = False
-        criteria5a = not snow_df[idx_tcb_min] and stc.TCB.min() < 1
-        criteria5b = not snow_df[idx_tcb_min] and stc.TCB.min() > 1
-        criteria6 = stc.NDVI.mean() < -0.2
-        criteria7 = stc.TCB.mean() > 0.45
-
-        if criteria1:
-            sel_pix_idx = stc.NDVI.idxmax()
-        elif criteria2:
-            sel_pix_idx = stc.mNDWI.idxmax()
-        elif criteria3:
-            sel_pix_idx = stc.NDVI.idxmax()
-        elif criteria4:
-            sel_pix_idx = idx_tcb_min
-        elif criteria5a:
-            sel_pix_idx = idx_tcb_min
-        elif criteria5b:
-            sel_pix_idx = None  # TODO: No valid pixels, set nan
-        elif criteria6:
-            sel_pix_idx = stc.mNDWI.idxmax()
-        elif criteria7:
-            sel_pix_idx = stc.NDVI.idxmin()
-        else:
-            sel_pix_idx = stc.NDVI.idxmax()
+        # Calculate indexes required for STC method
+        stc = stc_indexes(calc_pix)
+        # Select index with STC method
+        sel_pix_idx = stc_s2gm(stc, calc_pix, snow_df)
     else:
-        # print(f'Found {nok_one} valid pixels --> MEDOID')
         # Calculate sum of distances using the selected method
-        med = medoid(calc_pix, dist=medoid_distance)
-
+        med = medoid_s2gm(calc_pix, dist=medoid_distance)
         # Select pixel with min MEDOID value (shortest distance to others)
         sel_pix_idx = med.idxmin()
 
     return sel_pix_idx
 
 
-def list_paths_s2(main_dir, year, months):
-    # main_dir = 'Q:\\Sentinel-2_atm_10m_mosaicked_d96'
-    # # 'Q:\\Sentinel-2_atm_20m_mosaicked_d96'
+def list_paths_s2(st_date, en_date):
+    # Unpack input
+    y_st, m_st, d_st = st_date
+    y_en, m_en, d_en = en_date
 
-    year = str(year)
+    # Dirs with source files
+    mdir_10m = "Q:\\Sentinel-2_atm_10m_mosaicked_d96"
+    mdir_20m = "Q:\\Sentinel-2_atm_20m_mosaicked_d96"
 
-    q = os.path.join(main_dir, year) + "\\" + year + "*"
-    tif_dirs = glob.glob(q)
+    # Suffixes
+    sfx_img = "*_p2atm_d96tm.tif"
+    sfx_msk = "*_p2atm_mask_d96tm.tif"
 
-    selected = []
-    for m in months:
-        by_m = year + "\\" + year + f"{m:02d}"
-        selected = selected + [s for s in tif_dirs if by_m in s]
+    sdate = date(y_st, m_st, d_st)  # start date
+    edate = date(y_en, m_en, d_en)  # end date
+    delta = edate - sdate
 
-    tif_list = []
-    tif_masks = []
-    for d in selected:
-        qq = os.path.join(d, "*_p2atm_d96tm.tif")
-        pp = os.path.join(d, "*_p2atm_mask_d96tm.tif")
+    file_list = {"date": [],
+                 "image_10m": [],
+                 "image_20m": [],
+                 "mask_20m": []
+                 }
+    for i in range(delta.days + 1):
+        day = sdate + timedelta(days=i)
+        s_day = day.strftime("%Y%m%d")  # make date into string
+        s_year = day.strftime("%Y")
 
-        tif_f = glob.glob(qq)
-        tif_m = glob.glob(pp)
+        q10m = os.path.join(mdir_10m, s_year, s_day + "*")
+        q20m = os.path.join(mdir_20m, s_year, s_day + "*")
 
-        tif_list.append(tif_f[0])
-        tif_masks.append(tif_m[0])
+        dirs10m = glob.glob(q10m)
+        dirs20m = glob.glob(q20m)
 
-    return tif_list, tif_masks
+        if dirs10m is None:
+            dirs10m = []
+        if dirs20m is None:
+            dirs20m = []
+
+        dirs10m.sort()
+        dirs20m.sort()
+
+        if len(dirs10m) == len(dirs20m) and len(dirs10m) == 0:
+            continue
+        # elif len(dirs10m) == len(dirs20m) and len(dirs10m) == 1:
+        #     chk1 = os.path.split(dirs10m[0])[1][:-4]
+        #     chk2 = os.path.split(dirs20m[0])[1][:-4]
+        #     if not(chk1 == chk2):
+        #         raise Exception(f"Different 10m and 20m filename for date {s_day}")
+        elif len(dirs10m) == len(dirs20m) and len(dirs10m) > 0:
+            chk1 = [os.path.split(k)[1][:-4] for k in dirs10m]
+            chk2 = [os.path.split(k)[1][:-4] for k in dirs20m]
+            if not (chk1 == chk2):
+                raise Exception(f"Different 10m and 20m filenames for date {s_day}")
+        elif len(dirs10m) > len(dirs20m):
+            raise Exception(f"Filename {s_day} missing in 20m resolution")
+        else:
+            raise Exception(f"File {s_day} missing in 10m resolution")
+
+        for dir10, dir20 in zip(dirs10m, dirs20m):
+            q_i10 = os.path.join(dir10, sfx_img)
+            q_i20 = os.path.join(dir20, sfx_img)
+            q_m20 = os.path.join(dir20, sfx_msk)
+
+            pth_i10 = glob.glob(q_i10)[0]
+            pth_i20 = glob.glob(q_i20)[0]
+            pth_m20 = glob.glob(q_m20)[0]
+
+            file_list["date"].append(s_day)
+            file_list["image_10m"].append(pth_i10)
+            file_list["image_20m"].append(pth_i20)
+            file_list["mask_20m"].append(pth_m20)
+
+    df_paths = pd.DataFrame(file_list)
+
+    return df_paths
 
 
 def open_rio_list(df_inputs):
@@ -442,7 +538,6 @@ def open_rio_list(df_inputs):
 
 
 def close_rio_list(ds_list):
-    # TODO: TESTIRAJ!!!!!
     for file in ds_list:
         file.close()
 
@@ -484,17 +579,18 @@ def get_mask_value(pix_mask, criteria="less_than", threshold=35):
 
 def main():
     # ========= TEMPORARY INPUT ============================================
-    # bbox = [348890, 100000, 631610, 140000]
-    bbox = [500000, 100000, 600000, 140000]
-    # bbox = [599000, 100000, 600000, 101000]
+    # bbox = [348900, 16400, 631600, 201580]  # SLO w/o outermost pixels
+    # bbox = [500000, 110000, 530000, 130000]  # Celjska kotlina
+    # bbox = [500000, 110000, 502000, 112000]  # 100x100 in 20m
+    bbox = [500000, 110000, 504000, 114000]  # 100x100 in 20m
+    # bbox = [500000, 110000, 500100, 110100]  # XS
 
     # Set composite time frame (currently Jan 2019)
-    y = 2019
-    m = [1]
-    mdir_10m = 'Q:\\Sentinel-2_atm_10m_mosaicked_d96'
-    mdir_20m = 'Q:\\Sentinel-2_atm_20m_mosaicked_d96'
-    tif_list10, tif_masks10 = list_paths_s2(mdir_10m, y, m)
-    tif_list20, tif_masks20 = list_paths_s2(mdir_20m, y, m)
+    start_date = (2019, 3, 1)
+    end_date = (2019, 3, 31)
+
+    # Resolution
+    resolution = "10m"  # "10m" or "20m"
 
     # Medoid method
     medoid_distance = "euclid"  # Either "euclid" or "norm_diff"
@@ -505,7 +601,7 @@ def main():
 
     # Save paths/dir/names...
     save_dir = ".\\test_s2gm"
-    save_nam = "test05"
+    save_nam = "test11" + "_" + resolution
     # ======================================================================
 
     # ##### #
@@ -519,17 +615,18 @@ def main():
 
     # Create pandas table with info for all input images
     # --------------------------------------------------
-    inputs = {"image_10m": tif_list10,
-              "mask_10m": tif_masks10,
-              "image_20m": tif_list20,
-              "mask_20m": tif_masks20
-              }
-    df_inputs = pd.DataFrame(inputs)
+    df_inputs = list_paths_s2(start_date, end_date)
+    if df_inputs.empty:
+        raise Exception("Paths to source files not found!")
 
-    # TODO: Execute if list is not empty, if empty raise exception
     # Get extents of the output image
     # -------------------------------
-    main_extents = output_image_extent(df_inputs['image_20m'], bbox)
+    if resolution == "10m":
+        main_extents = output_image_extent(df_inputs['image_10m'], bbox)
+    elif resolution == "20m":
+        main_extents = output_image_extent(df_inputs['image_20m'], bbox)
+    else:
+        raise Exception(f"Value  {resolution}  is not valid resolution.")
 
     # Obtain properties of output array (same for all bands/images)
     out_extents = main_extents['bounds']
@@ -537,11 +634,9 @@ def main():
     out_h = main_extents['height']
     nr_bands = main_extents['bandsCount']
 
-    # Initiate arrays for storing number of available & good observations
+    # Initiate arrays (good obs, valid obs, output image)
     nobs = np.zeros((out_h, out_w), dtype=np.int8)
     nok = nobs.copy()
-
-    # Initiate main array
     composite = np.zeros((nr_bands, out_h, out_w), dtype=np.float32)
 
     # Metadata for both 10m and 20m (only 20m mask is used)
@@ -563,14 +658,14 @@ def main():
     try:
         # Open all files and append to data frame
         # The files stay open during the loop; CLOSE THEM AT THE END!
-        df_inputs['src_files_20m'] = open_rio_list(df_inputs['image_20m'])
-        df_inputs['src_masks_20m'] = open_rio_list(df_inputs['mask_20m'])
+        df_inputs["src_files_20m"] = open_rio_list(df_inputs["image_20m"])
+        df_inputs["src_masks_20m"] = open_rio_list(df_inputs["mask_20m"])
+        if resolution == "10m":
+            df_inputs["src_files_10m"] = open_rio_list(df_inputs["image_10m"])
 
         # LOOP OVER ALL PIXELS
-        # for (y, x), _ in np.ndenumerate(nobs):
-        for (y, x) in [(776, 816)]:
-            t_st = time.time()
-            # print(f"(x, y) = ({x}, {y})")
+        for (y, x), _ in np.ndenumerate(nobs):
+            # for (y, x) in [(132, 28), (132, 29)]:
             if x == 0 and y == 0:
                 print(f"   Processing line {y+1} of {out_h}...", end="")
             elif x == 0:
@@ -593,64 +688,78 @@ def main():
 
             # LOOP ALL INPUT IMAGES TO POPULATE THE CALCULATION TABLE
             for ind, row in df_inputs.iterrows():
-                # src_id = df_inputs.index.get_loc(ind)
                 # 1\ CHECK IF PIXEL EXISTS (in the current image)
                 # ==============================================================
-                # TODO: select correct meta (10m or 20m)
+                if resolution == "10m":
+                    r_meta = row["meta_10m"]
+                else:
+                    r_meta = row["meta_20m"]
+
                 chk_bbx = (
-                        row['meta_20m']['bounds'].right
+                        r_meta['bounds'].right
                         >= x_coord
-                        >= row['meta_20m']['bounds'].left
+                        >= r_meta['bounds'].left
                 )
                 chk_bby = (
-                    row['meta_20m']['bounds'].top
+                    r_meta['bounds'].top
                     >= y_coord
-                    >= row['meta_20m']['bounds'].bottom
+                    >= r_meta['bounds'].bottom
                 )
 
                 if not (chk_bbx and chk_bby):
-                    # print("skip: out of bounds")
                     continue
                 else:
-                    # Add one to valid observations
                     nobs_one += 1
 
                 # 2\ CHECK IF PIXEL IS GOOD (always use 20m mask)
                 # ==============================================================
                 # Get location of this pixel in mask
-                win = pixel_offset(row['meta_20m'], x_coord, y_coord)
+                win_20m = pixel_offset(row["meta_20m"], x_coord, y_coord)
+                if resolution == "10m":
+                    win_10m = pixel_offset(row["meta_10m"], x_coord, y_coord)
+                else:
+                    win_10m = None
                 # Read mask value
-                opm = row['src_masks_20m'].read(window=win)
+                opm = row["src_masks_20m"].read(window=win_20m)
                 # Determine pixel type (snow/valid/bad)
-                crt = get_mask_value(opm[0, 0, 0], mask_crt, mask_thr)
+                pix_class = get_mask_value(opm[0, 0, 0], mask_crt, mask_thr)
 
-                if crt == "snow":
+                if pix_class == "snow":
                     # Read the pixel so it can be checked for snow
-                    pix_20m = row["src_files_20m"].read(window=win).flatten()
+                    pix_snow = row["src_files_20m"].read(window=win_20m).flatten()
+                    if resolution == "10m":
+                        pix_10m = row["src_files_10m"].read(window=win_10m).flatten()
+                        pix_snow[0:3] = pix_10m[0:3]
+                        pix_snow[6] = pix_10m[3]
+
                     # Skip if pixel is zero (class. problem at swath border)
                     pixel_check = (
-                        any(np.isnan(pix_20m))
-                        or any(np.isinf(pix_20m))
-                        or any(pix_20m == 0)
+                        any(np.isnan(pix_snow))
+                        or any(np.isinf(pix_snow))
+                        or any(pix_snow == 0)
                     )
                     if pixel_check:
                         continue
-
-                    # Check for snow
-                    is_snow = isSnow(pix_20m)
-                    if is_snow:
-                        nok_one += 1
-                        one_pixel = pix_20m
                     else:
-                        continue
-                elif crt == "bad":  # not valid pixels
+                        # Check for snow
+                        is_snow = isSnow(pix_snow)
+                        if is_snow:
+                            nok_one += 1
+                            one_pixel = pix_snow
+                        else:
+                            continue
+                elif pix_class == "bad":  # not valid pixels
                     continue
                 else:
                     # Pixel is valid
-                    one_pixel = row["src_files_20m"].read(window=win).flatten()
+                    one_pixel = row["src_files_20m"].read(window=win_20m).flatten()
+                    if resolution == "10m":
+                        pix_10m = row["src_files_10m"].read(window=win_10m).flatten()
+                        one_pixel[0:3] = pix_10m[0:3]
+                        one_pixel[6] = pix_10m[3]
                     # Skip if pixel (any band) is zero/nan/inf
                     # (classification problem at swath border, mask shows good
-                    # pixel whe it is in fact bad)
+                    # pixel when it is in fact bad)
                     pixel_check = (
                             any(np.isnan(one_pixel))
                             or any(np.isinf(one_pixel))
@@ -663,30 +772,10 @@ def main():
                         nok_one += 1
                 # ==============================================================
 
-                # TODO:
-                # 4\ IF THIS IS 10m image, then read pixel from 20m for missing bands
-                #
-                # 10m bands: 1, 2, 3 are the same, 4 is put into 7 slot
-                #
-                # to read from 20m: 4, 5, 6 and 8, 9, 10
-                #
-                # ==============================================================
-
                 # \5 Populate Pandas Data Frame
                 # ==============================================================
-                # \5.1 Read from 10m or 20m
-                calc_pix.loc[ind, 'b2'] = one_pixel[0]
-                calc_pix.loc[ind, 'b3'] = one_pixel[1]
-                calc_pix.loc[ind, 'b4'] = one_pixel[2]
-                calc_pix.loc[ind, 'b8'] = one_pixel[6]
-                # \5.2 Always read from 20m
-                calc_pix.loc[ind, 'b5'] = one_pixel[3]
-                calc_pix.loc[ind, 'b6'] = one_pixel[4]
-                calc_pix.loc[ind, 'b7'] = one_pixel[5]
-                calc_pix.loc[ind, 'b8A'] = one_pixel[7]
-                calc_pix.loc[ind, 'b11'] = one_pixel[8]
-                calc_pix.loc[ind, 'b12'] = one_pixel[9]
-                # \5.3 Add isSnow test result
+                calc_pix.loc[ind] = one_pixel
+                # Add is_snow test result
                 snow_df.loc[ind] = is_snow
 
             # \6 Select pixel (different methods depending on nok)
@@ -699,15 +788,17 @@ def main():
                 # sel_pix = calc_pix.loc[sel_pix_idx].to_numpy(dtype='float32')
                 sel_pix = np.array(calc_pix.loc[sel_pix_idx])
             else:
-                sel_pix = np.full((nr_bands,), np.nan, dtype='float32')
+                sel_pix = np.full((10,), np.nan, dtype='float32')
 
             # # Populate the result matrices
             # sel_pix = np.reshape(sel_pix, (sel_pix.size, 1, 1))
-            composite[:, y, x] = sel_pix
+            if resolution == "10m":
+                composite[:, y, x] = np.append(sel_pix[0:3], sel_pix[6])
+            else:
+                composite[:, y, x] = sel_pix
+
             nobs[y, x] = nobs_one
             nok[y, x] = nok_one
-
-            # print(f" --> {time.time()-t_st} sec.")
 
         # Message when the final pixel was calculated
         print("     DONE!")
@@ -715,12 +806,17 @@ def main():
         # Close all data sets
         close_rio_list(df_inputs["src_files_20m"])
         close_rio_list(df_inputs["src_masks_20m"])
+        if resolution == "10m":
+            close_rio_list(df_inputs["src_files_10m"])
 
         # #### #
         # STOP #
         # #### #
         time_b = time.time()
         print(f"-- Total processing time: {time_b-time_a} --")
+    except Exception as e:
+        print("\n")
+        print(e)
     finally:
         # Save composite
         if not os.path.exists(save_dir):
@@ -729,7 +825,11 @@ def main():
         out_nam = save_nam + "_composite.tif"
         out_pth = os.path.join(save_dir, out_nam)
 
-        meta_pth = df_inputs.loc[0, "image_20m"]
+        if resolution == "10m":
+            meta_pth = df_inputs.loc[0, "image_10m"]
+        else:
+            meta_pth = df_inputs.loc[0, "image_20m"]
+
         with rasterio.open(meta_pth) as sample:
             meta_out = sample.profile.copy()
 
