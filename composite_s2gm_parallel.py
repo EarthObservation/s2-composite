@@ -18,7 +18,7 @@ import math
 import pandas as pd
 from affine import Affine
 # import logging
-# import concurrent.futures
+import concurrent.futures
 
 
 def round_multiple(nr, x_left, pix):
@@ -577,146 +577,158 @@ def get_mask_value(pix_mask, criteria="less_than", threshold=35):
         raise ValueError(f"Unrecognized value \"{criteria}\" in criteria.")
 
 
-def process_one_pix(id_yx, other):
+def process_one_line(y, other):
     """"""
     main_ex, df_inputs, resolution, mask_crt, mask_thr, medoid_distance = other
 
     out_extents = main_ex["bounds"]
+    wid_x = main_ex['width']
     pixels = main_ex['pixels']
-    y, x = id_yx
+    nr_bnd = main_ex['bandsCount']
 
-    # df_inputs["src_files_20m"] = open_rio_list(df_inputs["image_20m"])
-    # df_inputs["src_masks_20m"] = open_rio_list(df_inputs["mask_20m"])
-    # if resolution == "10m":
-    #     df_inputs["src_files_10m"] = open_rio_list(df_inputs["image_10m"])
+    df_inputs["src_files_20m"] = open_rio_list(df_inputs["image_20m"])
+    df_inputs["src_masks_20m"] = open_rio_list(df_inputs["mask_20m"])
+    if resolution == "10m":
+        df_inputs["src_files_10m"] = open_rio_list(df_inputs["image_10m"])
 
+    nobs = np.zeros((1, wid_x), dtype=np.int8)
+    nok = nobs.copy()
+    composite = np.zeros((nr_bnd, wid_x), dtype=np.float32)
     # TEMPORARY MESSAGE
-    # print(f"Started processing {id_yx}")
+    print(f"Started processing line {y+1}...")
+    for x in range(wid_x):
+        # Coordinates of the selected pixel (pixel center)
+        x_coord = out_extents[0] + (x + 0.5) * pixels[0]
+        y_coord = out_extents[3] - (y + 0.5) * pixels[1]
 
-    # Coordinates of the selected pixel (pixel center)
-    x_coord = out_extents[0] + (x + 0.5) * pixels[0]
-    y_coord = out_extents[3] - (y + 0.5) * pixels[1]
+        # Initiate table for the calculation of the best pixel
+        p_col = ['b2', 'b3', 'b4', 'b5', 'b6',
+                 'b7', 'b8', 'b8A', 'b11', 'b12']
+        calc_pix = pd.DataFrame(columns=p_col, dtype='float')
+        snow_df = pd.Series(dtype='bool')
 
-    # Initiate table for the calculation of the best pixel
-    p_col = ['b2', 'b3', 'b4', 'b5', 'b6',
-             'b7', 'b8', 'b8A', 'b11', 'b12']
-    calc_pix = pd.DataFrame(columns=p_col, dtype='float')
-    snow_df = pd.Series(dtype='bool')
+        # initiate variables
+        nobs_one = 0
+        nok_one = 0
 
-    # initiate variables
-    nobs_one = 0
-    nok_one = 0
-
-    # LOOP ALL INPUT IMAGES TO POPULATE THE CALCULATION TABLE
-    for ind, row in df_inputs.iterrows():
-        # 1\ CHECK IF PIXEL EXISTS (in the current image)
-        # ==============================================================
-        if resolution == "10m":
-            r_meta = row["meta_10m"]
-        else:
-            r_meta = row["meta_20m"]
-
-        chk_bbx = (
-                r_meta['bounds'].right
-                >= x_coord
-                >= r_meta['bounds'].left
-        )
-        chk_bby = (
-                r_meta['bounds'].top
-                >= y_coord
-                >= r_meta['bounds'].bottom
-        )
-
-        if not (chk_bbx and chk_bby):
-            continue
-        else:
-            nobs_one += 1
-
-        # 2\ CHECK IF PIXEL IS GOOD (always use 20m mask)
-        # ==============================================================
-        # Get location of this pixel in mask
-        win_20m = pixel_offset(row["meta_20m"], x_coord, y_coord)
-        if resolution == "10m":
-            win_10m = pixel_offset(row["meta_10m"], x_coord, y_coord)
-        else:
-            win_10m = None
-        # Read mask value
-        opm = row["src_masks_20m"].read(window=win_20m)
-        # Determine pixel type (snow/valid/bad)
-        pix_class = get_mask_value(opm[0, 0, 0], mask_crt, mask_thr)
-
-        if pix_class == "snow":
-            # Read the pixel so it can be checked for snow
-            pix_snow = row["src_files_20m"].read(window=win_20m).flatten()
+        # LOOP ALL INPUT IMAGES TO POPULATE THE CALCULATION TABLE
+        for ind, row in df_inputs.iterrows():
+            # 1\ CHECK IF PIXEL EXISTS (in the current image)
+            # ==============================================================
             if resolution == "10m":
-                pix_10m = row["src_files_10m"].read(window=win_10m).flatten()
-                pix_snow[0:3] = pix_10m[0:3]
-                pix_snow[6] = pix_10m[3]
+                r_meta = row["meta_10m"]
+            else:
+                r_meta = row["meta_20m"]
 
-            # Skip if pixel is zero (class. problem at swath border)
-            pixel_check = (
-                    any(np.isnan(pix_snow))
-                    or any(np.isinf(pix_snow))
-                    or any(pix_snow == 0)
+            chk_bbx = (
+                    r_meta['bounds'].right
+                    >= x_coord
+                    >= r_meta['bounds'].left
             )
-            if pixel_check:
+            chk_bby = (
+                    r_meta['bounds'].top
+                    >= y_coord
+                    >= r_meta['bounds'].bottom
+            )
+
+            if not (chk_bbx and chk_bby):
                 continue
             else:
-                # Check for snow
-                is_snow = isSnow(pix_snow)
-                if is_snow:
-                    nok_one += 1
-                    one_pixel = pix_snow
-                else:
+                nobs_one += 1
+
+            # 2\ CHECK IF PIXEL IS GOOD (always use 20m mask)
+            # ==============================================================
+            # Get location of this pixel in mask
+            win_20m = pixel_offset(row["meta_20m"], x_coord, y_coord)
+            if resolution == "10m":
+                win_10m = pixel_offset(row["meta_10m"], x_coord, y_coord)
+            else:
+                win_10m = None
+            # Read mask value
+            opm = row["src_masks_20m"].read(window=win_20m)
+            # Determine pixel type (snow/valid/bad)
+            pix_class = get_mask_value(opm[0, 0, 0], mask_crt, mask_thr)
+
+            if pix_class == "snow":
+                # Read the pixel so it can be checked for snow
+                pix_snow = row["src_files_20m"].read(window=win_20m).flatten()
+                if resolution == "10m":
+                    pix_10m = row["src_files_10m"].read(window=win_10m).flatten()
+                    pix_snow[0:3] = pix_10m[0:3]
+                    pix_snow[6] = pix_10m[3]
+
+                # Skip if pixel is zero (class. problem at swath border)
+                pixel_check = (
+                        any(np.isnan(pix_snow))
+                        or any(np.isinf(pix_snow))
+                        or any(pix_snow == 0)
+                )
+                if pixel_check:
                     continue
-        elif pix_class == "bad":  # not valid pixels
-            continue
-        else:
-            # Pixel is valid
-            one_pixel = row["src_files_20m"].read(window=win_20m).flatten()
-            if resolution == "10m":
-                pix_10m = row["src_files_10m"].read(window=win_10m).flatten()
-                one_pixel[0:3] = pix_10m[0:3]
-                one_pixel[6] = pix_10m[3]
-            # Skip if pixel (any band) is zero/nan/inf
-            # (classification problem at swath border, mask shows good
-            # pixel when it is in fact bad)
-            pixel_check = (
-                    any(np.isnan(one_pixel))
-                    or any(np.isinf(one_pixel))
-                    or any(one_pixel == 0)
-            )
-            if pixel_check:
+                else:
+                    # Check for snow
+                    is_snow = isSnow(pix_snow)
+                    if is_snow:
+                        nok_one += 1
+                        one_pixel = pix_snow
+                    else:
+                        continue
+            elif pix_class == "bad":  # not valid pixels
                 continue
             else:
-                is_snow = False
-                nok_one += 1
-        # ==============================================================
+                # Pixel is valid
+                one_pixel = row["src_files_20m"].read(window=win_20m).flatten()
+                if resolution == "10m":
+                    pix_10m = row["src_files_10m"].read(window=win_10m).flatten()
+                    one_pixel[0:3] = pix_10m[0:3]
+                    one_pixel[6] = pix_10m[3]
+                # Skip if pixel (any band) is zero/nan/inf
+                # (classification problem at swath border, mask shows good
+                # pixel when it is in fact bad)
+                pixel_check = (
+                        any(np.isnan(one_pixel))
+                        or any(np.isinf(one_pixel))
+                        or any(one_pixel == 0)
+                )
+                if pixel_check:
+                    continue
+                else:
+                    is_snow = False
+                    nok_one += 1
+            # ==============================================================
 
-        # \5 Populate Pandas Data Frame
-        # ==============================================================
-        calc_pix.loc[ind] = one_pixel
-        # Add is_snow test result
-        snow_df.loc[ind] = is_snow
+            # \5 Populate Pandas Data Frame
+            # ==============================================================
+            calc_pix.loc[ind] = one_pixel
+            # Add is_snow test result
+            snow_df.loc[ind] = is_snow
 
-    # \6 Select pixel (different methods depending on nok)
-    # ----------------------
-    sel_pix_idx = select_pixel(calc_pix, nok_one,
-                               snow_df, medoid_distance)
+        # \6 Select pixel (different methods depending on nok)
+        # ----------------------
+        sel_pix_idx = select_pixel(calc_pix, nok_one,
+                                   snow_df, medoid_distance)
 
-    # SELECT BEST PIXEL
-    if sel_pix_idx:
-        # sel_pix = calc_pix.loc[sel_pix_idx].to_numpy(dtype='float32')
-        sel_pix = np.array(calc_pix.loc[sel_pix_idx])
-    else:
-        sel_pix = np.full((10,), np.nan, dtype='float32')
+        # SELECT BEST PIXEL
+        if sel_pix_idx:
+            # sel_pix = calc_pix.loc[sel_pix_idx].to_numpy(dtype='float32')
+            sel_pix = np.array(calc_pix.loc[sel_pix_idx])
+        else:
+            sel_pix = np.full((10,), np.nan, dtype='float32')
 
-    # close_rio_list(df_inputs["src_files_20m"])
-    # close_rio_list(df_inputs["src_masks_20m"])
-    # if resolution == "10m":
-    #     close_rio_list(df_inputs["src_files_10m"])
+        # BUILD ROW OF OUTPUT MATRIX
+        nobs[:, x] = nobs_one
+        nok[:, x] = nok_one
+        if resolution == "10m":
+            composite[:, x] = np.append(sel_pix[0:3], sel_pix[6])
+        else:
+            composite[:, x] = sel_pix
 
-    return id_yx, sel_pix, nobs_one, nok_one
+    close_rio_list(df_inputs["src_files_20m"])
+    close_rio_list(df_inputs["src_masks_20m"])
+    if resolution == "10m":
+        close_rio_list(df_inputs["src_files_10m"])
+
+    return y, composite, nobs, nok
 
 
 def do_something(idx, other):
@@ -748,11 +760,11 @@ def main():
 
     # Mask/filtering
     mask_crt = "less_than"  # Either "less_than" or "all_bad"
-    mask_thr = 35
+    mask_thr = 33
 
     # Save paths/dir/names...
     save_dir = ".\\test_s2gm"
-    save_nam = "test17_lt35" + "_" + resolution
+    save_nam = "test17_lt33" + "_" + resolution
     # ======================================================================
 
     # ##### #
@@ -810,67 +822,49 @@ def main():
     # try:
     # Open all files and append to data frame
     # The files stay open during the loop; CLOSE THEM AT THE END!
-    df_inputs["src_files_20m"] = open_rio_list(df_inputs["image_20m"])
-    df_inputs["src_masks_20m"] = open_rio_list(df_inputs["mask_20m"])
-    if resolution == "10m":
-        df_inputs["src_files_10m"] = open_rio_list(df_inputs["image_10m"])
+    # df_inputs["src_files_20m"] = open_rio_list(df_inputs["image_20m"])
+    # df_inputs["src_masks_20m"] = open_rio_list(df_inputs["mask_20m"])
+    # if resolution == "10m":
+    #     df_inputs["src_files_10m"] = open_rio_list(df_inputs["image_10m"])
 
-    other = (
-        main_extents, df_inputs,
-        resolution, mask_crt,
-        mask_thr, medoid_distance
-    )
+    # seconds = 0.1
+    # nok_value = 42
+    # other = (seconds, nok_value)
+    other = (main_extents, df_inputs,
+             resolution, mask_crt,
+             mask_thr, medoid_distance
+             )
+
+    # PROCESS LINES IN PARALLEL
+    print("Start processing in parallel...")
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        results = [executor.submit(process_one_line, line, other) for line in range(out_h)]
+
+        for f in concurrent.futures.as_completed(results):
+            idy, r_comp, r_nobs, r_nok = f.result()
+            nobs[idy, :] = r_nobs
+            nok[idy, :] = r_nok
+            composite[:, idy, :] = r_comp
+            print(f" >> Done value: {idy+1}")
 
     # # LOOP OVER ALL PIXELS
-    # print("Start processing in parallel...")
-    # with concurrent.futures.ProcessPoolExecutor() as executor:
-    #     results = [executor.submit(process_one_pix, xy, other) for xy, _ in np.ndenumerate(nobs)]
+    # for y in range(out_h):
+    #     pix_rslt = process_one_line(y, other)
     #
-    #     for f in concurrent.futures.as_completed(results):
-    #         # use as completed to append to fill the array
-    #         idx, res, foo, boo = f.result()
-    #         yy, xx = idx
-    #         nobs[yy, xx] = foo
-    #         nok[yy, xx] = boo
-    #         if resolution == "10m":
-    #             composite[:, yy, xx] = np.append(res[0:3], res[6])
-    #         else:
-    #             composite[:, yy, xx] = res
-    #         print(f" >> Done value: {idx}")
-    #
-    # print(nobs)
-    # print(nok)
-
-    for (y, x), _ in np.ndenumerate(nobs):
-        if y == 0 and x == 0:
-            print(f"   Processing line {y + 1} of {out_h}...", end="")
-        elif x == 0:
-            print("     DONE!")
-            print(f"   Processing line {y + 1} of {out_h}...", end="")
-
-        pix_rslt = process_one_pix((y, x), other)
-
-        coord, sel_pix, nobs_one, nok_one = pix_rslt
-
-        # # Populate the result matrices
-        # sel_pix = np.reshape(sel_pix, (sel_pix.size, 1, 1))
-        yy, xx = coord
-        if resolution == "10m":
-            composite[:, yy, xx] = np.append(sel_pix[0:3], sel_pix[6])
-        else:
-            composite[:, yy, xx] = sel_pix
-
-        nobs[yy, xx] = nobs_one
-        nok[yy, xx] = nok_one
+    #     idy, r_comp, r_nobs, r_nok = pix_rslt
+    #     nobs[idy, :] = r_nobs
+    #     nok[idy, :] = r_nok
+    #     composite[:, idy, :] = r_comp
+    #     print(f" >> Done line: {idy+1}")
 
     # Message when the final pixel was calculated
     print("     DONE!")
 
     # Close all data sets
-    close_rio_list(df_inputs["src_files_20m"])
-    close_rio_list(df_inputs["src_masks_20m"])
-    if resolution == "10m":
-        close_rio_list(df_inputs["src_files_10m"])
+    # close_rio_list(df_inputs["src_files_20m"])
+    # close_rio_list(df_inputs["src_masks_20m"])
+    # if resolution == "10m":
+    #     close_rio_list(df_inputs["src_files_10m"])
 
     # #### #
     # STOP #
@@ -881,7 +875,6 @@ def main():
     #     print("\n")
     #     print(e)
     # finally:
-    # =>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>=>
     # Save composite
     if not os.path.exists(save_dir):
         os.mkdir(save_dir)
