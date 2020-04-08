@@ -593,6 +593,7 @@ def process_one_line(y, other):
 
     nobs = np.zeros((1, wid_x), dtype=np.int8)
     nok = nobs.copy()
+    sobs = nobs.copy()
     composite = np.zeros((nr_bnd, wid_x), dtype=np.float32)
     # TEMPORARY MESSAGE
     print(f"Started processing line {y+1}...")
@@ -714,8 +715,10 @@ def process_one_line(y, other):
             sel_pix = np.array(calc_pix.loc[sel_pix_idx])
         else:
             sel_pix = np.full((10,), np.nan, dtype='float32')
+            sel_pix_idx = -1
 
         # BUILD ROW OF OUTPUT MATRIX
+        sobs[:, x] = sel_pix_idx + 1
         nobs[:, x] = nobs_one
         nok[:, x] = nok_one
         if resolution == "10m":
@@ -728,10 +731,11 @@ def process_one_line(y, other):
     if resolution == "10m":
         close_rio_list(df_inputs["src_files_10m"])
 
-    return y, composite, nobs, nok
+    return y, composite, nobs, nok, sobs
 
 
 def do_something(idx, other):
+    # TODO: Remove (used only for development of multiprocessing)
     seconds, nok_value = other
     print(f'Process for {idx} started... execution time {seconds}s')
     time.sleep(seconds)
@@ -740,36 +744,10 @@ def do_something(idx, other):
     return idx, rslt, nobs_value, nok_value
 
 
-def main():
-    # ========= TEMPORARY INPUT ============================================
-    # bbox = [348900, 16400, 631600, 201580]  # SLO w/o outermost pixels
-    # bbox = [500000, 110000, 530000, 130000]  # Celjska kotlina
-    # bbox = [500000, 110000, 502000, 112000]  # 100x100 in 20m
-    bbox = [500000, 110000, 504000, 114000]  # 200x200 in 20m
-    # bbox = [500000, 110000, 500100, 110100]  # XS
-
-    # Set composite time frame (currently Jan 2019)
-    start_date = (2019, 3, 1)
-    end_date = (2019, 3, 31)
-
-    # Resolution
-    resolution = "10m"  # "10m" or "20m"
-
-    # Medoid method
-    medoid_distance = "euclid"  # Either "euclid" or "norm_diff"
-
-    # Mask/filtering
-    mask_crt = "less_than"  # Either "less_than" or "all_bad"
-    mask_thr = 33
-
-    # Save paths/dir/names...
-    save_dir = ".\\test_s2gm"
-    save_nam = "test17_lt33" + "_" + resolution
-    # ======================================================================
-
-    # ##### #
-    # START #
-    # ##### #
+def main(bbox, start_date, end_date, resolution,
+         medoid_distance, mask_crt, mask_thr,
+         save_dir, save_nam
+         ):
     time_a = time.time()
 
     # =========================== #
@@ -801,6 +779,7 @@ def main():
     print("Preparing data for processing.")
     nobs = np.zeros((out_h, out_w), dtype=np.int8)
     nok = nobs.copy()
+    sobs = nobs.copy()
     composite = np.zeros((nr_bands, out_h, out_w), dtype=np.float32)
 
     # Metadata for both 10m and 20m (only 20m mask is used)
@@ -837,11 +816,14 @@ def main():
 
     # PROCESS LINES IN PARALLEL
     print("Start processing in parallel...")
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        results = [executor.submit(process_one_line, line, other) for line in range(out_h)]
+    cpu_limit = os.cpu_count()-1
+    with concurrent.futures.ProcessPoolExecutor(max_workers=cpu_limit) as exc:
+        results = [exc.submit(process_one_line, line, other)
+                   for line in range(out_h)]
 
         for f in concurrent.futures.as_completed(results):
-            idy, r_comp, r_nobs, r_nok = f.result()
+            idy, r_comp, r_nobs, r_nok, r_sobs = f.result()
+            sobs[idy, :] = r_sobs
             nobs[idy, :] = r_nobs
             nok[idy, :] = r_nok
             composite[:, idy, :] = r_comp
@@ -900,6 +882,7 @@ def main():
         transform=out_trans, bigtiff="yes"
         )
 
+    # Save nok mask
     with rasterio.open(out_pth, "w", **meta_out) as dest:
         dest.write(composite)
 
@@ -921,6 +904,58 @@ def main():
     with rasterio.open(out_pth, "w", **nok_meta) as dest:
         dest.write(np.expand_dims(nobs, axis=0))
 
+    # Save sobs mask
+    out_nam = save_nam + "_sobs.tif"
+    out_pth = os.path.join(save_dir, out_nam)
+    with rasterio.open(out_pth, "w", **nok_meta) as dest:
+        dest.write(np.expand_dims(sobs, axis=0))
+
+    # save legend for sel_obs mask
+    sobs_legend = df_inputs["date"]
+    sobs_legend.index += 1
+    out_nam = save_nam + "_sobs.txt"
+    out_pth = os.path.join(save_dir, out_nam)
+    with open(out_pth, "w") as dest:
+        dest.write(sobs_legend.to_string())
+
 
 if __name__ == "__main__":
-    main()
+    # TEMPORARY INPUT
+    # bbox = [348900, 16400, 631600, 201580]  # SLO w/o outermost pixels
+    # bbox = [500000, 110000, 530000, 130000]  # Celjska kotlina
+    # bbox = [500000, 110000, 502000, 112000]  # 100x100 in 20m
+    # bbox = [500000, 110000, 504000, 114000]  # 200x200 in 20m
+    # bbox = [500000, 110000, 500100, 110100]  # XS
+    in_bbox = [597540, 154360, 610660, 165000]  # ref Mura 2017
+
+    # Set composite time frame (currently Jan 2019)
+    in_start_date = (2017, 7, 1)
+    in_end_date = (2017, 7, 31)
+
+    # Resolution
+    in_resolution = "20m"  # "10m" or "20m"
+
+    # Medoid method
+    in_medoid_distance = "euclid"  # Either "euclid" or "norm_diff"
+
+    # Mask/filtering
+    in_mask_crt = "less_than"  # Either "less_than" or "all_bad"
+    in_mask_thr = 35
+
+    # Save paths/dir/names...
+    in_save_dir = ".\\test_Mura-2017-07"
+    str_name = "mura-01"
+
+    if in_mask_crt == "less_than":
+        mcs = "lt"
+    elif in_mask_crt == "all_bad":
+        mcs = "keep"
+    else:
+        raise Exception(f"{in_mask_crt} is not a valid value for mask criteria!"
+                        "\nchoose either 'less_than' or 'all_bad'")
+    in_save_nam = str_name + "_" + mcs + str(in_mask_thr) + "_" + in_resolution
+
+    # RUN MAIN
+    main(in_bbox, in_start_date, in_end_date, in_resolution,
+         in_medoid_distance, in_mask_crt, in_mask_thr,
+         in_save_dir, in_save_nam)
