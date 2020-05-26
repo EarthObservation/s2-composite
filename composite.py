@@ -7,19 +7,17 @@
 
 @history:
     Created on Fri Feb  7 10:18:07 2020
+
+Compositing algorithm based on the code developed by Klemen Cotar for PROBA-V.
 """
 
 import rasterio
-# from rasterio.mask import mask
 from rasterio.windows import Window
 from shutil import rmtree
 import os
 import time
 import math
-# import geopandas as gpd
-# from shapely.geometry import box
 import numpy as np
-
 import dask.array as da
 import pickle
 from affine import Affine

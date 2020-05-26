@@ -5,15 +5,22 @@
       <w>celjska</w>
       <w>compositing</w>
       <w>dest</w>
+      <w>dirname</w>
       <w>dtype</w>
       <w>edate</w>
       <w>euclidian</w>
       <w>filenames</w>
+      <w>filfol</w>
+      <w>filnam</w>
+      <w>foldnam</w>
+      <w>frst</w>
       <w>kirches</w>
       <w>kotlina</w>
       <w>mdir</w>
       <w>medoid</w>
       <w>mosaicked</w>
+      <w>mosaicking</w>
+      <w>mura</w>
       <w>ncoz</w>
       <w>ndenumerate</w>
       <w>ndsi</w>
@@ -23,8 +30,13 @@
       <w>rowi</w>
       <w>rowj</w>
       <w>rslt</w>
+      <w>sazu</w>
       <w>sdate</w>
+      <w>shutil</w>
+      <w>stepfilled</w>
+      <w>stin</w>
       <w>throught</w>
+      <w>uint</w>
       <w>xmax</w>
       <w>xmin</w>
       <w>ymax</w>
