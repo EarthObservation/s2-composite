@@ -20,11 +20,20 @@ S2GM website: [https://s2gm.sentinel-hub.com/](https://s2gm.sentinel-hub.com/)
 ## composite_s2gm_parallel.py
 Parallelised version of composite_s2gm.py (using concurent.futures module for processing on multiple cores).
 
+## composite_s2gm.py
+Initial version of the compositing algorithm. Processing on single core, very slow. (REMOVE WHEN FINISHED)
+
 ## composite.py
 Early version of the algorithm, based on the mosaicking algorithm for PROBA-V written by Klemen Cotar. Much faster then S2GM but doesn't select an actual pixel, i.e. each band is processed separately from each other.
 
-## find_pth.py
+## tif_to_jpg.py
+A quick routine to obtain RGB preview of a GeTIFF.
+
+## z_find_pth.py
 Used for development. (REMOVE WHEN FINISHED)
 
-## time_rasterio.py
+## z_time_rasterio.py
 Used for development. (REMOVE WHEN FINISHED)
+
+## Travinje_Mura-2017_report_final.pdf
+Technical report: Testing of the compositing algorithm for Sentinel-2 products

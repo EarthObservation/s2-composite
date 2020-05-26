@@ -4,11 +4,19 @@ Created on Fri Feb 21 09:09:31 2020
 
 @author: ncoz
 
-This code will be used for compositing based on max NDVI
+Creates temporal composites of Sentinel-2 products.
+
+Based on the S2GM mosaicking method <INSERT REFERENCE>. The time interval of the
+composite is given at input (works best for monthly or seasonal intervals). The
+processing is preformed on pixel-by-pixel basis. It selects the best available
+pixel from the input images, where the selected pixel retains the original
+value. Depending on the number of available pixels, two different selection
+methods are used, namely (i) Short Term Composite (STC) for n < 4 and
+(ii) Medoid for n >= 4.
 """
 
 import numpy as np
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 import glob
 import os
 import time
@@ -17,8 +25,8 @@ from rasterio.windows import Window
 import math
 import pandas as pd
 from affine import Affine
-# import logging
 import concurrent.futures
+# from histogram import png_hist
 
 
 def round_multiple(nr, x_left, pix):
@@ -102,7 +110,7 @@ def output_image_extent(src_fps, bbox):
     tif_ext, pix_res, src_all, bnd_num = ([] for _ in range(4))
 
     for idx, fp in src_fps.items():
-        print('Opening raster {}'.format(fp[109:-20]))
+        print(f"Opening raster {fp[109:-20]}")
         with rasterio.open(fp) as src:
             src_all.append(src)
             # Read raster properties
@@ -219,6 +227,7 @@ def pixel_offset(image_meta, x_coord, y_coord):
 
 
 def collect_meta(image_paths):
+    """Returns a list of meta data of all input images."""
     img_meta = []
     for tif in image_paths:
         with rasterio.open(tif) as ds:
@@ -231,8 +240,10 @@ def collect_meta(image_paths):
 
 
 def isSnow(one_pixel):
-    # with rasterio.open(tif_path) as ds:
-    #     one_pixel = ds.read(window=win).flatten()
+    """Returns results of a snow test.
+
+    True if pixel is snow, false if it isn't.
+    """
 
     tcb = (0.3029 * one_pixel[0]  # b2
            + 0.2786 * one_pixel[1]  # b3
@@ -249,21 +260,20 @@ def isSnow(one_pixel):
 
 
 def medoid_s2gm(calc_pix, dist='euclid'):
+    """Returns sum of distances between pixels for Medoid method."""
     s = pd.Series(index=calc_pix.index, dtype='float')
-    for ii, rowi in calc_pix.iterrows():
+    for i, rowi in calc_pix.iterrows():
         e_dist = 0
-        for ij, rowj in calc_pix.drop([ii]).iterrows():
-            # Calculate Euclidian distance
+        for _, rowj in calc_pix.drop([i]).iterrows():
+            # Calculate distance
             if dist == 'euclid':
                 e_dist += np.sqrt(((rowj - rowi) ** 2).sum())
             elif dist == 'norm_diff':
-                # e_bnd[bd] = (xB - xA)**2
-                # abs((xB - xA) / (xB + xA))
                 e_dist += abs((rowj - rowi) / (rowj + rowi)).sum()
             else:
                 raise Exception('Error: Unknown distance for MEDOID.')
         # Update column
-        s.loc[ii] = e_dist
+        s.loc[i] = e_dist
 
     return s
 
@@ -434,6 +444,11 @@ def stc_cloud_test(s_pix):
 
 
 def select_pixel(calc_pix, nok_one, snow_df, medoid_distance):
+    """Returns the index of the best pixel.
+
+    The selection method is based on the number of available observations
+    (nok_one).
+    """
     if nok_one == 0:
         sel_pix_idx = None
     elif nok_one == 1:
@@ -453,6 +468,11 @@ def select_pixel(calc_pix, nok_one, snow_df, medoid_distance):
 
 
 def list_paths_s2(st_date, en_date):
+    """Returns DataFrame with paths to input files.
+
+    Search for S-2 files within the given time frame. The location of the fies
+    is hard coded to the location on ZRC SAZU network dive.
+    """
     # Unpack input
     y_st, m_st, d_st = st_date
     y_en, m_en, d_en = en_date
@@ -472,7 +492,8 @@ def list_paths_s2(st_date, en_date):
     file_list = {"date": [],
                  "image_10m": [],
                  "image_20m": [],
-                 "mask_20m": []
+                 "mask_20m": [],
+                 "file_folder": []
                  }
     for i in range(delta.days + 1):
         day = sdate + timedelta(days=i)
@@ -518,11 +539,13 @@ def list_paths_s2(st_date, en_date):
             pth_i10 = glob.glob(q_i10)[0]
             pth_i20 = glob.glob(q_i20)[0]
             pth_m20 = glob.glob(q_m20)[0]
+            filfol = os.path.basename(os.path.dirname(pth_i20)[:-4])
 
             file_list["date"].append(s_day)
             file_list["image_10m"].append(pth_i10)
             file_list["image_20m"].append(pth_i20)
             file_list["mask_20m"].append(pth_m20)
+            file_list["file_folder"].append(filfol)
 
     df_paths = pd.DataFrame(file_list)
 
@@ -530,6 +553,7 @@ def list_paths_s2(st_date, en_date):
 
 
 def open_rio_list(df_inputs):
+    """Returns a list with rasterio-open-file objects of all input files."""
     src_files = []
     for item in df_inputs:
         src_files.append(rasterio.open(item))
@@ -538,6 +562,7 @@ def open_rio_list(df_inputs):
 
 
 def close_rio_list(ds_list):
+    """Closes the opened rasterio objects."""
     for file in ds_list:
         file.close()
 
@@ -578,27 +603,40 @@ def get_mask_value(pix_mask, criteria="less_than", threshold=35):
 
 
 def process_one_line(y, other):
-    """"""
+    """Returns an array containing selected pixels for one line of the image"""
+    t_line = time.time()
     main_ex, df_inputs, resolution, mask_crt, mask_thr, medoid_distance = other
 
+    # Obtain extents and other meta data
     out_extents = main_ex["bounds"]
     wid_x = main_ex['width']
     pixels = main_ex['pixels']
     nr_bnd = main_ex['bandsCount']
 
+    # Open GeoTIFFs for reading
     df_inputs["src_files_20m"] = open_rio_list(df_inputs["image_20m"])
     df_inputs["src_masks_20m"] = open_rio_list(df_inputs["mask_20m"])
     if resolution == "10m":
         df_inputs["src_files_10m"] = open_rio_list(df_inputs["image_10m"])
 
+    # TODO: Read all files (entire row) before we start processing individual pixels
+    # Loop over all files:
+    # 1\ Open file with rasterio
+    # 2\ Read an entire row
+    # 3\ Find a smart way to store the data: each image will generate an array
+    #    in a format [<nr of bands>, 1, <width>] and the same single row for
+    #    each accompanying mask [1, 1, <width>] (and another if 10m is
+    #    required [<nr of bands>, 1, <width>])
+
+    # Initiate output arrays
     nobs = np.zeros((1, wid_x), dtype=np.int8)
     nok = nobs.copy()
     sobs = nobs.copy()
     composite = np.zeros((nr_bnd, wid_x), dtype=np.float32)
-    # TEMPORARY MESSAGE
+
     print(f"Started processing line {y+1}...")
     for x in range(wid_x):
-        # Coordinates of the selected pixel (pixel center)
+        # Calculate coordinates of the selected pixel (pixel center)
         x_coord = out_extents[0] + (x + 0.5) * pixels[0]
         y_coord = out_extents[3] - (y + 0.5) * pixels[1]
 
@@ -646,15 +684,15 @@ def process_one_line(y, other):
             else:
                 win_10m = None
             # Read mask value
-            opm = row["src_masks_20m"].read(window=win_20m)
+            opm = row["src_masks_20m"].read(window=win_20m)  # TODO: Change read
             # Determine pixel type (snow/valid/bad)
             pix_class = get_mask_value(opm[0, 0, 0], mask_crt, mask_thr)
 
             if pix_class == "snow":
                 # Read the pixel so it can be checked for snow
-                pix_snow = row["src_files_20m"].read(window=win_20m).flatten()
+                pix_snow = row["src_files_20m"].read(window=win_20m).flatten()  # TODO: Change read
                 if resolution == "10m":
-                    pix_10m = row["src_files_10m"].read(window=win_10m).flatten()
+                    pix_10m = row["src_files_10m"].read(window=win_10m).flatten()  # TODO: Change read
                     pix_snow[0:3] = pix_10m[0:3]
                     pix_snow[6] = pix_10m[3]
 
@@ -677,6 +715,7 @@ def process_one_line(y, other):
             elif pix_class == "bad":  # not valid pixels
                 continue
             else:
+                # TODO: Change if we read the entire row beforehand
                 # Pixel is valid
                 one_pixel = row["src_files_20m"].read(window=win_20m).flatten()
                 if resolution == "10m":
@@ -696,28 +735,24 @@ def process_one_line(y, other):
                 else:
                     is_snow = False
                     nok_one += 1
-            # ==============================================================
 
-            # \5 Populate Pandas Data Frame
+            # \5 Populate table
             # ==============================================================
             calc_pix.loc[ind] = one_pixel
             # Add is_snow test result
             snow_df.loc[ind] = is_snow
 
-        # \6 Select pixel (different methods depending on nok)
-        # ----------------------
+        # SELECT BEST PIXEL (different methods depending on nok)
         sel_pix_idx = select_pixel(calc_pix, nok_one,
                                    snow_df, medoid_distance)
 
-        # SELECT BEST PIXEL
-        if sel_pix_idx:
-            # sel_pix = calc_pix.loc[sel_pix_idx].to_numpy(dtype='float32')
+        if sel_pix_idx is not None:
             sel_pix = np.array(calc_pix.loc[sel_pix_idx])
         else:
             sel_pix = np.full((10,), np.nan, dtype='float32')
             sel_pix_idx = -1
 
-        # BUILD ROW OF OUTPUT MATRIX
+        # POPULATE THE OUTPUT ARRAY
         sobs[:, x] = sel_pix_idx + 1
         nobs[:, x] = nobs_one
         nok[:, x] = nok_one
@@ -726,34 +761,29 @@ def process_one_line(y, other):
         else:
             composite[:, x] = sel_pix
 
+    # Close all GeoTIFF files
     close_rio_list(df_inputs["src_files_20m"])
     close_rio_list(df_inputs["src_masks_20m"])
     if resolution == "10m":
         close_rio_list(df_inputs["src_files_10m"])
 
+    t_line = time.time() - t_line
+    print(f"  Time processing line {y+1} = {t_line} sec.")
+
     return y, composite, nobs, nok, sobs
 
 
-def do_something(idx, other):
-    # TODO: Remove (used only for development of multiprocessing)
-    seconds, nok_value = other
-    print(f'Process for {idx} started... execution time {seconds}s')
-    time.sleep(seconds)
-    nobs_value = idx[0] + idx[1]
-    rslt = np.full((10, 1, 1), nobs_value)
-    return idx, rslt, nobs_value, nok_value
-
-
 def main(bbox, start_date, end_date, resolution,
-         medoid_distance, mask_crt, mask_thr,
-         save_dir, save_nam
+         medoid_distance, mask_crt, mask_thr, save_loc
          ):
     time_a = time.time()
+
+    # CREATE SAVE LOCATION
+    os.makedirs(save_loc, exist_ok=True)
 
     # =========================== #
     # GET ALL REQUIRED PARAMETERS #
     # =========================== #
-
     # Create pandas table with info for all input images
     # --------------------------------------------------
     df_inputs = list_paths_s2(start_date, end_date)
@@ -769,55 +799,110 @@ def main(bbox, start_date, end_date, resolution,
     else:
         raise Exception(f"Value  {resolution}  is not valid resolution.")
 
-    # Obtain properties of output array (same for all bands/images)
+    # Obtain properties of output array
+    # ---------------------------------
     out_extents = main_extents['bounds']
     out_w = main_extents['width']
     out_h = main_extents['height']
     nr_bands = main_extents['bandsCount']
 
+    # Remove images that fall out of bounds
+    # -------------------------------------
+    if main_extents['skip']:
+        df_inputs = df_inputs.drop(index=main_extents['skip'])
+        df_inputs.reset_index(drop=True, inplace=True)
+
+    # Read metadata and append do df
+    # ------------------------------
+    df_inputs['meta_20m'] = pd.Series(
+        collect_meta(list(df_inputs['image_20m']))
+    )
+    if resolution == "10m":
+        df_inputs['meta_10m'] = pd.Series(
+            collect_meta(list(df_inputs['image_10m']))
+        )
+
+    # Create save directory in the save location
+    frst = df_inputs['file_folder'].iloc[0]
+    last = df_inputs['file_folder'].iloc[-1]
+    save_nam = frst[:8] + "_" + last[:8] + "_" + resolution
+    save_dir = os.path.join(save_loc, save_nam)
+    if not os.path.exists(save_dir):
+        os.mkdir(save_dir)
+
+    # CREATE LOG FILE
+    log_nam = "LOG.txt"
+    log_pth = os.path.join(save_dir, log_nam)
+    with open(log_pth, "w") as dest:
+        # dest.write(sobs_legend.to_string())
+        dest.write("#" * 36
+                   + "\n# Log of S-2 compositing algorithm #\n"
+                   + "#"*36 + "\n" * 2)
+        current_time = datetime.now()
+        dest.write(current_time.strftime("%a, %d %b %Y %H:%M:%S\n"))
+        dest.write("\nInputs:\n" + "=" * 26 + "\n")
+        dest.write("Compositing time interval:\n")
+        stin = f"{start_date[2]:02d}-{start_date[1]:02d}-{start_date[0]}"
+        stout = f"{end_date[2]:02d}-{end_date[1]:02d}-{end_date[0]}"
+        dest.write(f"From: {stin}\n")
+        dest.write(f"To:   {stout}\n")
+
+        dest.write("\nGeographical extents:\n")
+        for lim, nm in zip(out_extents, ["Xmin", "Ymin", "Xmax", "Ymax"]):
+            dest.write(f"{nm}:  {lim:.2f}\n")
+
+        dest.write("\nFiltering criteria:\n")
+        if mask_crt == "less_than":
+            dest.write(f"Valid if mask is {mask_thr} or greater\n")
+        elif mask_crt == "all_bad":
+            dest.write(f"Valid if mask equals {mask_thr}\n")
+        else:
+            dest.write(f"{mask_crt} {mask_thr}\n")
+
+        dest.write("\nSave location:\n")
+        dest.write(os.path.abspath(save_dir) + "\\\n")
+
+        dest.write("\nSelected spatial resolution:\n")
+        dest.write(resolution + "\n")
+
+        dest.write("\nImages selected for compositing:\n")
+        # os.path.basename(os.path.dirname(df_inputs["image_20m"][0]))
+        if resolution == "20m":
+            sel_files = df_inputs["image_20m"]
+        else:
+            sel_files = df_inputs["image_10m"]
+
+        for _, item in sel_files.items():
+            dest.write(os.path.basename(item) + "\n")
+
+    # TODO: Copy input files to local SSD
+    # 1\ Create temporary folder
+    # 2\ Shutil copy
+    # 3\ Update df_inputs with paths to temporary files
+
     # Initiate arrays (good obs, valid obs, output image)
+    # ---------------------------------------------------
     print("Preparing data for processing.")
     nobs = np.zeros((out_h, out_w), dtype=np.int8)
     nok = nobs.copy()
     sobs = nobs.copy()
     composite = np.zeros((nr_bands, out_h, out_w), dtype=np.float32)
 
-    # Metadata for both 10m and 20m (only 20m mask is used)
-    df_inputs['meta_10m'] = pd.Series(
-        collect_meta(list(df_inputs['image_10m']))
-    )
-    df_inputs['meta_20m'] = pd.Series(
-        collect_meta(list(df_inputs['image_20m']))
-    )
-
-    # FILTER LIST OF IMAGES (if any fall out of bounds)
-    if main_extents['skip']:
-        df_inputs = df_inputs.drop(index=main_extents['skip'])
-        df_inputs.reset_index(drop=True, inplace=True)
-
-    # =========================== #
+    # ========= #
     # MAIN LOOP #
-    # =========================== #
-    # try:
-    # Open all files and append to data frame
-    # The files stay open during the loop; CLOSE THEM AT THE END!
-    # df_inputs["src_files_20m"] = open_rio_list(df_inputs["image_20m"])
-    # df_inputs["src_masks_20m"] = open_rio_list(df_inputs["mask_20m"])
-    # if resolution == "10m":
-    #     df_inputs["src_files_10m"] = open_rio_list(df_inputs["image_10m"])
-
-    # seconds = 0.1
-    # nok_value = 42
-    # other = (seconds, nok_value)
+    # ========= #
+    print("Start processing in parallel...")
     other = (main_extents, df_inputs,
              resolution, mask_crt,
              mask_thr, medoid_distance
              )
+    if out_h < os.cpu_count()-1:
+        cpu_limit = None
+    else:
+        cpu_limit = os.cpu_count()-1
 
-    # PROCESS LINES IN PARALLEL
-    print("Start processing in parallel...")
-    cpu_limit = os.cpu_count()-1
     with concurrent.futures.ProcessPoolExecutor(max_workers=cpu_limit) as exc:
+        # with concurrent.futures.ProcessPoolExecutor() as exc:
         results = [exc.submit(process_one_line, line, other)
                    for line in range(out_h)]
 
@@ -829,133 +914,139 @@ def main(bbox, start_date, end_date, resolution,
             composite[:, idy, :] = r_comp
             print(f" >> Done value: {idy+1}")
 
-    # # LOOP OVER ALL PIXELS
-    # for y in range(out_h):
-    #     pix_rslt = process_one_line(y, other)
-    #
-    #     idy, r_comp, r_nobs, r_nok = pix_rslt
-    #     nobs[idy, :] = r_nobs
-    #     nok[idy, :] = r_nok
-    #     composite[:, idy, :] = r_comp
-    #     print(f" >> Done line: {idy+1}")
-
     # Message when the final pixel was calculated
     print("     DONE!")
-
-    # Close all data sets
-    # close_rio_list(df_inputs["src_files_20m"])
-    # close_rio_list(df_inputs["src_masks_20m"])
-    # if resolution == "10m":
-    #     close_rio_list(df_inputs["src_files_10m"])
-
-    # #### #
-    # STOP #
-    # #### #
     time_b = time.time()
     print(f"-- Total processing time: {time_b-time_a} --")
-    # except Exception as e:
-    #     print("\n")
-    #     print(e)
-    # finally:
-    # Save composite
-    if not os.path.exists(save_dir):
-        os.mkdir(save_dir)
 
-    out_nam = save_nam + "_composite.tif"
-    out_pth = os.path.join(save_dir, out_nam)
+    # =================== #
+    # SAVE RESULTS TO TIF #
+    # =================== #
 
+    # ----- Prepare meta data -----
     if resolution == "10m":
         meta_pth = df_inputs.loc[0, "image_10m"]
     else:
         meta_pth = df_inputs.loc[0, "image_20m"]
-
     with rasterio.open(meta_pth) as sample:
         meta_out = sample.profile.copy()
-
     x_lf_out = out_extents[0]
     y_up_out = out_extents[3]
     af_out = meta_out.get('transform')
     out_trans = Affine(af_out.a, 0.0, x_lf_out, 0.0, af_out.e, y_up_out)
+    meta_out.update(height=composite.shape[1],
+                    width=composite.shape[2],
+                    transform=out_trans,
+                    bigtiff="yes"
+                    )
 
-    meta_out.update(
-        height=composite.shape[1], width=composite.shape[2],
-        transform=out_trans, bigtiff="yes"
-        )
-
-    # Save nok mask
+    # ---------- Save composite ----------
+    out_nam = save_nam + "_composite.tif"
+    out_pth = os.path.join(save_dir, out_nam)
     with rasterio.open(out_pth, "w", **meta_out) as dest:
         dest.write(composite)
+    # Add to log
+    with open(log_pth, "a") as dest:
+        dest.write("\nList of delivered files:\n")
+        dest.write(f"* {out_nam}\n")
 
-    # Save nok mask
+    # ----- Prepare meta data for masks -----
+    nok_meta = meta_out.copy()
+    nok_meta.update(count=1, dtype="int8")
+
+    # ---------- Save nok mask -----------
     out_nam = save_nam + "_nok.tif"
     out_pth = os.path.join(save_dir, out_nam)
-    nok_meta = meta_out.copy()
-    nok_meta.update(
-        count=1,
-        dtype="int8"
-        )
-
     with rasterio.open(out_pth, "w", **nok_meta) as dest:
         dest.write(np.expand_dims(nok, axis=0))
+    with open(log_pth, "a") as dest:
+        dest.write(f"* {out_nam}\n")
 
-    # Save nobs mask
+    # # Make histogram for NOK
+    # img_count = len(df_inputs.index)
+    # hist_p = png_hist(out_pth, img_count)
+    # hist_p = os.path.basename(hist_p)
+    # with open(log_pth, "a") as dest:
+    #     dest.write(f"* {hist_p}\n")
+
+    # ---------- Save nobs mask ----------
     out_nam = save_nam + "_nobs.tif"
     out_pth = os.path.join(save_dir, out_nam)
     with rasterio.open(out_pth, "w", **nok_meta) as dest:
         dest.write(np.expand_dims(nobs, axis=0))
+    with open(log_pth, "a") as dest:
+        dest.write(f"* {out_nam}\n")
 
-    # Save sobs mask
+    # ---------- Save sobs mask ----------
     out_nam = save_nam + "_sobs.tif"
     out_pth = os.path.join(save_dir, out_nam)
     with rasterio.open(out_pth, "w", **nok_meta) as dest:
         dest.write(np.expand_dims(sobs, axis=0))
+    with open(log_pth, "a") as dest:
+        dest.write(f"* {out_nam}\n")
 
-    # save legend for sel_obs mask
+    # # Make histogram for NOK
+    # hist_p = png_hist(out_pth, img_count)
+    # hist_p = os.path.basename(hist_p)
+    # with open(log_pth, "a") as dest:
+    #     dest.write(f"* {hist_p}\n")
+
+    # ---------- Save sobs legend to txt ----------
     sobs_legend = df_inputs["date"]
     sobs_legend.index += 1
     out_nam = save_nam + "_sobs.txt"
     out_pth = os.path.join(save_dir, out_nam)
     with open(out_pth, "w") as dest:
         dest.write(sobs_legend.to_string())
+    with open(log_pth, "a") as dest:
+        dest.write(f"* {out_nam}\n")
+
+    # TODO: Remove temporary files
+
+    # Save total processing time to LOG
+    with open(log_pth, "a") as dest:
+        dest.write(f"\n-- Total processing time: {time_b - time_a} seconds --\n")
 
 
 if __name__ == "__main__":
-    # TEMPORARY INPUT
-    # bbox = [348900, 16400, 631600, 201580]  # SLO w/o outermost pixels
-    # bbox = [500000, 110000, 530000, 130000]  # Celjska kotlina
-    # bbox = [500000, 110000, 502000, 112000]  # 100x100 in 20m
-    # bbox = [500000, 110000, 504000, 114000]  # 200x200 in 20m
-    # bbox = [500000, 110000, 500100, 110100]  # XS
-    in_bbox = [597540, 154360, 610660, 165000]  # ref Mura 2017
-
-    # Set composite time frame (currently Jan 2019)
-    in_start_date = (2017, 7, 1)
-    in_end_date = (2017, 7, 31)
-
+    # INPUTS:
+    # ==========================================================================
+    # in_bbox = None
+    in_bbox = [597540, 154160, 597600, 154400]  # Small region for testing
     # Resolution
     in_resolution = "20m"  # "10m" or "20m"
-
     # Medoid method
     in_medoid_distance = "euclid"  # Either "euclid" or "norm_diff"
 
-    # Mask/filtering
-    in_mask_crt = "less_than"  # Either "less_than" or "all_bad"
-    in_mask_thr = 35
+    start = [(2018, 4, 1)]
+    end = [(2018, 4, 30)]
+    msk = ["less_than"]
+    thr = [41]
+    # dire = ["q:\\Sentinel-2_20m_monthly-composites"]
+    dire = [".\\test_01"]
 
-    # Save paths/dir/names...
-    in_save_dir = ".\\test_Mura-2017-07"
-    str_name = "mura-01"
+    inp = pd.DataFrame(
+        {"start": start,
+         "end": end,
+         "msk": msk,
+         "thr": thr,
+         "dir": dire}
+    )
 
-    if in_mask_crt == "less_than":
-        mcs = "lt"
-    elif in_mask_crt == "all_bad":
-        mcs = "keep"
-    else:
-        raise Exception(f"{in_mask_crt} is not a valid value for mask criteria!"
-                        "\nchoose either 'less_than' or 'all_bad'")
-    in_save_nam = str_name + "_" + mcs + str(in_mask_thr) + "_" + in_resolution
+    for ii, rr in inp.iterrows():
+        print(f"Start processing item no {ii}")
+        # Set composite time frame (currently Jan 2019)
+        in_start_date = rr["start"]
+        in_end_date = rr["end"]
+        # Mask/filtering
+        in_mask_crt = rr["msk"]
+        in_mask_thr = rr["thr"]
+        # Save paths/dir/names...
+        in_save_dir = rr["dir"]
+        # str_name = rr["nam"]
 
-    # RUN MAIN
-    main(in_bbox, in_start_date, in_end_date, in_resolution,
-         in_medoid_distance, in_mask_crt, in_mask_thr,
-         in_save_dir, in_save_nam)
+        # RUN MAIN
+        # ======================================================================
+        main(in_bbox, in_start_date, in_end_date, in_resolution,
+             in_medoid_distance, in_mask_crt, in_mask_thr,
+             in_save_dir)

@@ -705,7 +705,7 @@ def process_one_pix(id_yx, other):
                                snow_df, medoid_distance)
 
     # SELECT BEST PIXEL
-    if sel_pix_idx:
+    if sel_pix_idx is not None:
         # sel_pix = calc_pix.loc[sel_pix_idx].to_numpy(dtype='float32')
         sel_pix = np.array(calc_pix.loc[sel_pix_idx])
     else:
@@ -733,25 +733,26 @@ def main():
     # bbox = [348900, 16400, 631600, 201580]  # SLO w/o outermost pixels
     # bbox = [500000, 110000, 530000, 130000]  # Celjska kotlina
     # bbox = [500000, 110000, 502000, 112000]  # 100x100 in 20m
-    bbox = [500000, 110000, 504000, 114000]  # 200x200 in 20m
+    # bbox = [500000, 110000, 504000, 114000]  # 200x200 in 20m
     # bbox = [500000, 110000, 500100, 110100]  # XS
+    bbox = [597540, 154360, 610660, 165000]  # ref Mura 2017
 
     # Set composite time frame (currently Jan 2019)
-    start_date = (2019, 3, 1)
-    end_date = (2019, 3, 31)
+    start_date = (2017, 4, 1)
+    end_date = (2017, 4, 31)
 
     # Resolution
-    resolution = "10m"  # "10m" or "20m"
+    resolution = "20m"  # "10m" or "20m"
 
     # Medoid method
     medoid_distance = "euclid"  # Either "euclid" or "norm_diff"
 
     # Mask/filtering
     mask_crt = "less_than"  # Either "less_than" or "all_bad"
-    mask_thr = 35
+    mask_thr = 31
 
     # Save paths/dir/names...
-    save_dir = ".\\test_s2gm"
+    save_dir = ".\\test_s2gm-v2"
     save_nam = "test17_lt35" + "_" + resolution
     # ======================================================================
 
@@ -841,7 +842,8 @@ def main():
     # print(nobs)
     # print(nok)
 
-    for (y, x), _ in np.ndenumerate(nobs):
+    # for (y, x), _ in np.ndenumerate(nobs):
+    for (y, x) in [(109, 647)]:
         if y == 0 and x == 0:
             print(f"   Processing line {y + 1} of {out_h}...", end="")
         elif x == 0:
