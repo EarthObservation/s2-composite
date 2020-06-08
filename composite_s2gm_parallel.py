@@ -17,6 +17,7 @@ methods are used, namely (i) Short Term Composite (STC) for n < 4 and
 
 import concurrent.futures
 import glob
+import logging
 import os
 import subprocess
 import time
@@ -43,8 +44,8 @@ def copy_file(src_pth, dest_dir):
     timer = time.time() - timer
 
     if status == 0:
-        print(f"File {src_pth} successfully copied to {dest_dir}.")
-        print(f" --> Time: {timer} sec.")
+        logging.info(f"File {src_pth} successfully copied to {dest_dir}.")
+        logging.info(f" --> Time: {timer} sec.")
     else:
         raise Exception(f"Could not copy {src_pth} to temp folder.")
 
@@ -132,7 +133,7 @@ def output_image_extent(src_fps, bbox):
     tif_ext, pix_res, src_all, bnd_num = ([] for _ in range(4))
 
     for idx, fp in src_fps.items():
-        print(f"Opening raster {fp[109:-20]}")
+        logging.info(f"Opening raster {fp[109:-20]}")
         with rasterio.open(fp) as src:
             src_all.append(src)
             # Read raster properties
@@ -204,7 +205,7 @@ def output_image_extent(src_fps, bbox):
               }
 
     end_time = time.time() - str_time
-    print(f'--- Time to evaluate geo. extents: {end_time} seconds ---')
+    logging.info(f'Time to evaluate geo. extents: {end_time} sec.')
     return output
 
 
@@ -248,8 +249,43 @@ def pixel_offset(image_meta, x_coord, y_coord):
     return rd_win
 
 
+def horizontal_offset(image_meta, x_coord):
+    """Finds the position of the selected pixel in the current image.
+
+    Parameters
+    ----------
+    image_meta : dictionary
+        Must include keys:
+            "bounds" which is a bounding box object from TIF meta data,
+            "pixels" which is a pixel resolution tuple from TIF meta data.
+    x_coord : float
+        X coordinate of the pixel center.
+
+    Returns
+    -------
+    rd_win : TYPE
+        Offset window for reading a single pixel from one line array.
+
+    """
+    # Output image extents
+    xlf_out = image_meta['bounds'].left
+
+    # Read pixel resolution
+    pix_x, _ = image_meta['pixels']
+
+    # Calculate x position
+    x_off = x_coord - xlf_out
+    x_off = math.floor(x_off/pix_x)
+
+    return x_off
+
+
 def vertical_offset(image_meta, y_coord):
     """Finds the position of the selected pixel in the current image.
+
+    If the coordinate of the pixel that is being read is larger then upper
+    bounds of the image (e.g. y_coord = 95 and y_max = 80), the output will be
+    negative (e.g. -2 for the example above).
 
     Parameters
     ----------
@@ -266,13 +302,13 @@ def vertical_offset(image_meta, y_coord):
         Vertical offset of the pixel (row) from the top of the input array.
 
     """
-    # Output image extents
-    _, _, _, yup_out = image_meta['bounds']
+    # Extents of the image that is being read
+    yup_out = image_meta['bounds'].top
 
     # Read pixel resolution
     _, pix_y = image_meta['pixels']
 
-    # Y-direction
+    # Calculate row number from the input image to be read
     y_off = yup_out - y_coord
     y_off = math.floor(y_off/pix_y)
 
@@ -668,15 +704,11 @@ def read_line_from_gtifs(input_paths, y):
     """
     list_of_lines = []
     for ind, row in input_paths.iteritems():
-        ntt = time.time()
-        print(f"Read line {y.iloc[ind]} from {row}")
         with rasterio.open(row) as dest:
             _, ar_w = dest.shape
             win = Window(0, y.iloc[ind], ar_w, 1)
             # Read line and append to a list
             list_of_lines.append(dest.read(window=win))
-        ntt = time.time() - ntt
-        print(f" --- Time = {ntt} sec. --- ")
 
     return list_of_lines
 
@@ -703,13 +735,20 @@ def process_one_line(y, other):
     vertical_off = []
     for ind, row in df_inputs.iterrows():
         vertical_off.append(vertical_offset(row.meta_20m, y_coord))
+        # TODO: Also add vertical offset for 10m option
     df_inputs["vertical_offset"] = vertical_off
 
     # TODO: Read all files (entire row) before we start processing individual pixels
+    ntt = time.time()
+    logging.info(f"Read lines from all files for row {y+1}.")
+
     df_inputs['array_20m'] = read_line_from_gtifs(df_inputs["temp_img20"], df_inputs["vertical_offset"])
     df_inputs['array_mask'] = read_line_from_gtifs(df_inputs["temp_msk20"], df_inputs["vertical_offset"])
     if resolution == "10m":
         df_inputs['array_10m'] = read_line_from_gtifs(["temp_img20"], df_inputs["vertical_offset"])
+
+    ntt = time.time() - ntt
+    logging.info(f"Time = {ntt} sec.\n")
 
     # Initiate output arrays
     nobs = np.zeros((1, wid_x), dtype=np.int8)
@@ -717,7 +756,7 @@ def process_one_line(y, other):
     sobs = nobs.copy()
     composite = np.zeros((nr_bnd, wid_x), dtype=np.float32)
 
-    print(f"Started processing line {y+1}...")
+    # logging.info(f"Started processing line {y+1}...")
     for x in range(wid_x):
         # Calculate coordinates of the selected pixel (pixel center)
         x_coord = out_extents[0] + (x + 0.5) * pixels[0]
@@ -743,17 +782,8 @@ def process_one_line(y, other):
             else:
                 r_meta = row["meta_20m"]
 
-            chk_bbx = (
-                    r_meta['bounds'].right
-                    >= x_coord
-                    >= r_meta['bounds'].left
-            )
-            chk_bby = (
-                    r_meta['bounds'].top
-                    >= y_coord
-                    >= r_meta['bounds'].bottom
-            )
-
+            chk_bbx = r_meta['bounds'].right >= x_coord >= r_meta['bounds'].left
+            chk_bby = r_meta['bounds'].top >= y_coord >= r_meta['bounds'].bottom
             if not (chk_bbx and chk_bby):
                 continue
             else:
@@ -762,13 +792,15 @@ def process_one_line(y, other):
             # 2\ CHECK IF PIXEL IS GOOD (always use 20m mask)
             # ==============================================================
             # Get location of this pixel in mask
-            win_20m = pixel_offset(row["meta_20m"], x_coord, y_coord)  # TODO: Need to get the offset in a row only
+            hoff_20m = horizontal_offset(row["meta_20m"], x_coord)
+            # win_20m = pixel_offset(row["meta_20m"], x_coord, y_coord)  # TODO: Need to get the offset in a row only
             if resolution == "10m":
-                win_10m = pixel_offset(row["meta_10m"], x_coord, y_coord)
+                hoff_10m = horizontal_offset(row["meta_10m"], x_coord)
+                # win_10m = pixel_offset(row["meta_10m"], x_coord, y_coord)
             else:
-                win_10m = None
+                hoff_10m = None
             # Read mask value
-            opm = row.array_mask[:, :, win_20m.col_off]
+            opm = row.array_mask[:, :, hoff_20m]
             # opm = row["src_masks_20m"].read(window=win_20m)  # TODO: Change read (from array)
 
             # Determine pixel type (snow/valid/bad)
@@ -776,10 +808,10 @@ def process_one_line(y, other):
 
             if pix_class == "snow":
                 # Read the pixel so it can be checked for snow
-                pix_snow = row.array_20m[:, :, win_20m.col_off].flatten()
+                pix_snow = row.array_20m[:, :, hoff_20m].flatten()
                 # pix_snow = row["src_files_20m"].read(window=win_20m).flatten()  # TODO: Change read
                 if resolution == "10m":
-                    pix_10m = row.array_10m[:, :, win_10m.col_off].flatten()
+                    pix_10m = row.array_10m[:, :, hoff_10m].flatten()
                     # pix_10m = row["src_files_10m"].read(window=win_10m).flatten()  # TODO: Change read
                     pix_snow[0:3] = pix_10m[0:3]
                     pix_snow[6] = pix_10m[3]
@@ -805,10 +837,10 @@ def process_one_line(y, other):
             else:
                 # TODO: Change if we read the entire row beforehand
                 # Pixel is valid
-                one_pixel = row.array_20m[:, :, win_20m.col_off].flatten()
+                one_pixel = row.array_20m[:, :, hoff_20m].flatten()
                 # one_pixel = row["src_files_20m"].read(window=win_20m).flatten()
                 if resolution == "10m":
-                    pix_10m = row.array_10m[:, :, win_10m.col_off].flatten()
+                    pix_10m = row.array_10m[:, :, hoff_10m].flatten()
                     # pix_10m = row["src_files_10m"].read(window=win_10m).flatten()
                     one_pixel[0:3] = pix_10m[0:3]
                     one_pixel[6] = pix_10m[3]
@@ -858,7 +890,7 @@ def process_one_line(y, other):
     #     close_rio_list(df_inputs["src_files_10m"])
 
     t_line = time.time() - t_line
-    print(f"  Time processing line {y+1} = {t_line} sec.")
+    logging.info(f"Time processing line {y+1} = {t_line} sec.")
 
     return y, composite, nobs, nok, sobs
 
@@ -872,6 +904,50 @@ def main(bbox, start_date, end_date, resolution,
     # CREATE SAVE LOCATION
     os.makedirs(save_loc, exist_ok=True)
 
+    # Create output folder (time interval + resolution)
+    # -------------------------------------------------
+    frst = f"{start_date[0]}{start_date[1]:02d}{start_date[2]:02d}"
+    last = f"{end_date[0]}{end_date[1]:02d}{end_date[2]:02d}"
+    save_nam = frst + "_" + last + "_" + resolution
+    save_dir = os.path.join(save_loc, save_nam)
+    os.makedirs(save_dir, exist_ok=True)
+
+    # CREATE LOG FILE AND TURN ON LOGGING
+    log_nam = "LOG.txt"
+    log_pth = os.path.join(save_dir, log_nam)
+    logging.basicConfig(filename=log_pth,
+                        format='%(asctime)s - %(levelname)s - %(message)s',
+                        level=logging.INFO)
+    logging.getLogger("rasterio").setLevel(logging.ERROR)
+    with open(log_pth, "w") as dest:
+        dest.write("#" * 36
+                   + "\n# Log of S-2 compositing algorithm #\n"
+                   + "#"*36 + "\n" * 2)
+        current_time = datetime.now()
+        dest.write("Time started: ")
+        dest.write(current_time.strftime("%a, %d %b %Y %H:%M:%S\n"))
+        dest.write("\nInputs:\n" + "=" * 26 + "\n")
+
+        dest.write("Save location:\n")
+        dest.write(os.path.abspath(save_dir) + "\\\n")
+
+        dest.write("\nCompositing time interval:\n")
+        stin = f"{start_date[2]:02d}-{start_date[1]:02d}-{start_date[0]}"
+        stout = f"{end_date[2]:02d}-{end_date[1]:02d}-{end_date[0]}"
+        dest.write(f"From: {stin}\n")
+        dest.write(f"To:   {stout}\n")
+        dest.write("\nFiltering criteria:\n")
+
+        if mask_crt == "less_than":
+            dest.write(f"Valid if mask is {mask_thr} or greater\n")
+        elif mask_crt == "all_bad":
+            dest.write(f"Valid if mask equals {mask_thr}\n")
+        else:
+            dest.write(f"{mask_crt} {mask_thr}\n")
+
+        dest.write("\nSelected spatial resolution:\n")
+        dest.write(resolution + "\n" * 2)
+
     # =========================== #
     # GET ALL REQUIRED PARAMETERS #
     # =========================== #
@@ -884,7 +960,7 @@ def main(bbox, start_date, end_date, resolution,
     # Get extents of the output image
     # -------------------------------
     if resolution == "10m":
-        main_extents = output_image_extent(df_inputs['image_10m'], bbox)
+        main_extents = output_image_extent(df_inputs['image_10m'], bbox)  # TODO: CHANGE TO TEMP
     elif resolution == "20m":
         main_extents = output_image_extent(df_inputs['image_20m'], bbox)
     else:
@@ -913,49 +989,12 @@ def main(bbox, start_date, end_date, resolution,
             collect_meta(list(df_inputs['image_10m']))
         )
 
-    # Create save directory in the save location
-    # ------------------------------------------
-    frst = df_inputs['file_folder'].iloc[0]
-    last = df_inputs['file_folder'].iloc[-1]
-    save_nam = frst[:8] + "_" + last[:8] + "_" + resolution
-    save_dir = os.path.join(save_loc, save_nam)
-    os.makedirs(save_dir, exist_ok=True)
-
-    # CREATE LOG FILE
-    # ---------------
-    log_nam = "LOG.txt"
-    log_pth = os.path.join(save_dir, log_nam)
-    with open(log_pth, "w") as dest:
-        # dest.write(sobs_legend.to_string())
-        dest.write("#" * 36
-                   + "\n# Log of S-2 compositing algorithm #\n"
-                   + "#"*36 + "\n" * 2)
-        current_time = datetime.now()
-        dest.write(current_time.strftime("%a, %d %b %Y %H:%M:%S\n"))
-        dest.write("\nInputs:\n" + "=" * 26 + "\n")
-        dest.write("Compositing time interval:\n")
-        stin = f"{start_date[2]:02d}-{start_date[1]:02d}-{start_date[0]}"
-        stout = f"{end_date[2]:02d}-{end_date[1]:02d}-{end_date[0]}"
-        dest.write(f"From: {stin}\n")
-        dest.write(f"To:   {stout}\n")
-
+    # Add geographical extents to LOG
+    # -------------------------------
+    with open(log_pth, "a") as dest:
         dest.write("\nGeographical extents:\n")
         for lim, nm in zip(out_extents, ["Xmin", "Ymin", "Xmax", "Ymax"]):
             dest.write(f"{nm}:  {lim:.2f}\n")
-
-        dest.write("\nFiltering criteria:\n")
-        if mask_crt == "less_than":
-            dest.write(f"Valid if mask is {mask_thr} or greater\n")
-        elif mask_crt == "all_bad":
-            dest.write(f"Valid if mask equals {mask_thr}\n")
-        else:
-            dest.write(f"{mask_crt} {mask_thr}\n")
-
-        dest.write("\nSave location:\n")
-        dest.write(os.path.abspath(save_dir) + "\\\n")
-
-        dest.write("\nSelected spatial resolution:\n")
-        dest.write(resolution + "\n")
 
         dest.write("\nImages selected for compositing:\n")
         # os.path.basename(os.path.dirname(df_inputs["image_20m"][0]))
@@ -966,6 +1005,7 @@ def main(bbox, start_date, end_date, resolution,
 
         for _, item in sel_files.items():
             dest.write(os.path.basename(item) + "\n")
+        dest.write("\n")
 
     # TODO: Copy input files to temp folder on local SSD
     # --------------------------------------------------
@@ -974,21 +1014,29 @@ def main(bbox, start_date, end_date, resolution,
     os.makedirs(temp_folder, exist_ok=True)
 
     # Copy all files to temp folder and add new paths to df
-    print("Copy input files to temp folder...")
+    logging.info("Copying input files to temp folder...")
     time_cp2tmp = time.time()
     df_inputs['temp_img20'] = None
     df_inputs['temp_msk20'] = None
-    for ind, row in df_inputs.iterrows():
-        if test_case:  # TODO: CHANGE NETWORK DISK PATHS AFTER DEVELOPMENT
-            df_inputs['temp_img20'].iloc[ind] = (
-                ".\\temp_images_test\\20180401T100019_S2B_MSIL2A_20180401T120347"
-                "_C122_20m__ms_p2atm_d96tm.tif"
-            )
-            df_inputs['temp_msk20'].iloc[ind] = (
-                ".\\temp_images_test\\20180401T100019_S2B_MSIL2A_20180401T120347"
-                "_C122_20m__ms_p2atm_mask_d96tm.tif"
-            )
-        else:
+    if test_case:  # TODO: CHANGE NETWORK DISK PATHS AFTER DEVELOPMENT
+        df_inputs['temp_img20'].iloc[0] = (
+            ".\\temp_images_test\\20180401T100019_S2B_MSIL2A_20180401T120347"
+            "_C122_20m__ms_p2atm_d96tm.tif"
+        )
+        df_inputs['temp_msk20'].iloc[0] = (
+            ".\\temp_images_test\\20180401T100019_S2B_MSIL2A_20180401T120347"
+            "_C122_20m__ms_p2atm_mask_d96tm.tif"
+        )
+        df_inputs['temp_img20'].iloc[1] = (
+            ".\\temp_images_test\\20180403T095031_S2A_MSIL2A_20180403T115447"
+            "_E079_20m__ms_p2atm_d96tm.tif"
+        )
+        df_inputs['temp_msk20'].iloc[1] = (
+            ".\\temp_images_test\\20180403T095031_S2A_MSIL2A_20180403T115447"
+            "_E079_20m__ms_p2atm_mask_d96tm.tif"
+        )
+    else:
+        for ind, row in df_inputs.iterrows():
             # 20 m image
             tmp_img_20 = copy_file(row['image_20m'], temp_folder)
             df_inputs['temp_img20'].iloc[ind] = tmp_img_20
@@ -996,19 +1044,18 @@ def main(bbox, start_date, end_date, resolution,
             tmp_msk_20 = copy_file(row['mask_20m'], temp_folder)
             df_inputs['temp_msk20'].iloc[ind] = tmp_msk_20
 
-    # 10 m mask
-    if resolution == "10m":
-        df_inputs['temp_img10'] = None
-        for ind, row in df_inputs.iterrows():
-            tmp_img_10 = copy_file(row['image_10m'], temp_folder)
-            df_inputs['temp_img10'].iloc[ind] = tmp_img_10
+        # 10 m mask
+        if resolution == "10m":
+            df_inputs['temp_img10'] = None
+            for ind, row in df_inputs.iterrows():
+                tmp_img_10 = copy_file(row['image_10m'], temp_folder)
+                df_inputs['temp_img10'].iloc[ind] = tmp_img_10
 
     time_cp2tmp = time.time() - time_cp2tmp
-    print(f" -- Time to copy files to temp folder: {time_cp2tmp} sec. --")
+    logging.info(f"Time to copy files to temp folder: {time_cp2tmp} sec.\n")
 
     # Initiate arrays (good obs, valid obs, output image)
     # ---------------------------------------------------
-    print("Preparing data for processing.")
     nobs = np.zeros((out_h, out_w), dtype=np.int8)
     nok = nobs.copy()
     sobs = nobs.copy()
@@ -1020,11 +1067,11 @@ def main(bbox, start_date, end_date, resolution,
     other = (main_extents, df_inputs, resolution,
              mask_crt, mask_thr, medoid_distance)
     if parallel:
-        print("Start processing in parallel...")
-        if out_h < os.cpu_count()-1:
+        logging.info("Start processing in parallel...\n")
+        if out_h < os.cpu_count()-2:
             cpu_limit = None
         else:
-            cpu_limit = os.cpu_count()-1
+            cpu_limit = os.cpu_count()-2
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=cpu_limit) as exc:
             # with concurrent.futures.ProcessPoolExecutor() as exc:
@@ -1037,20 +1084,20 @@ def main(bbox, start_date, end_date, resolution,
                 nobs[idy, :] = r_nobs
                 nok[idy, :] = r_nok
                 composite[:, idy, :] = r_comp
-                print(f" >> Done value: {idy+1}")
+                # logging.info(f" >> Done value: {idy+1}")
     else:
+        logging.info("Start processing...\n")
         for line in range(out_h):
             idy, r_comp, r_nobs, r_nok, r_sobs = process_one_line(line, other)
             sobs[idy, :] = r_sobs
             nobs[idy, :] = r_nobs
             nok[idy, :] = r_nok
             composite[:, idy, :] = r_comp
-            print(f" >> Done value: {idy + 1}")
+            # logging.info(f" >> Done value: {idy + 1}")
 
     # Message when the final pixel was calculated
-    print("     DONE!")
     time_b = time.time()
-    print(f"-- Total processing time: {time_b-time_a} --")
+    logging.info(f"Finished! Processing time: {time_b-time_a} sec.")
 
     # =================== #
     # SAVE RESULTS TO TIF #
@@ -1138,7 +1185,7 @@ def main(bbox, start_date, end_date, resolution,
 
     # Save total processing time to LOG
     with open(log_pth, "a") as dest:
-        dest.write(f"\n-- Total processing time: {time_b - time_a} seconds --\n")
+        dest.write(f"\n-- Total run time: {time_b - time_a} seconds --\n")
 
 
 if __name__ == "__main__":
@@ -1146,14 +1193,14 @@ if __name__ == "__main__":
     # ==========================================================================
     # in_bbox = None
     # in_bbox = [597540, 154160, 597600, 154400]  # Small region for testing
-    in_bbox = [379000, 36400, 379200, 36600]  # SLO bottom left
+    in_bbox = [480400, 36400, 480600, 36600]  # SLO bottom left
     # Resolution
     in_resolution = "20m"  # "10m" or "20m"
     # Medoid method
     in_medoid_distance = "euclid"  # Either "euclid" or "norm_diff"
 
     start = [(2018, 4, 1)]
-    end = [(2018, 4, 2)]
+    end = [(2018, 4, 4)]
     msk = ["less_than"]
     thr = [41]
     # dire = ["q:\\Sentinel-2_20m_monthly-composites"]
