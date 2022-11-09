@@ -897,8 +897,7 @@ def process_one_line(y, other):
 
 def main(bbox, start_date, end_date, resolution,
          medoid_distance, mask_crt, mask_thr, save_loc,
-         parallel=True, test_case=False
-         ):
+         parallel=True, test_case=False):
     time_a = time.time()
 
     # CREATE SAVE LOCATION

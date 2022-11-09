@@ -15,6 +15,7 @@ import rasterio
 from rasterio.windows import Window
 from shutil import rmtree
 import os
+from os.path import dirname, basename, split, join
 import time
 import math
 import numpy as np
@@ -22,6 +23,96 @@ import dask.array as da
 import pickle
 from affine import Affine
 import cv2
+import glob
+from datetime import date, timedelta, datetime
+import pandas as pd
+import logging
+
+
+
+
+def list_paths_s2(st_date, en_date):
+    # TODO: Delete temporary input
+    temp_path = "D:\\__temp GitHub\\s2-composite\\temp_images_2016_4_"
+    st_date = (2016, 4, 1)
+    en_date = (2016, 4, 30)
+    # Unpack input
+    y_st, m_st, d_st = st_date
+    y_en, m_en, d_en = en_date
+    # Dirs with source files
+    # mdir_10m = "Q:\\Sentinel-2_atm_10m_mosaicked_d96"
+    # mdir_20m = "Q:\\Sentinel-2_atm_20m_mosaicked_d96"
+    mdir_10m = temp_path + "10m"
+    mdir_20m = temp_path + "20m"
+
+    # Suffixes
+    sfx_img = "*_p2atm_d96tm.tif"
+    sfx_msk = "*_p2atm_mask_d96tm.tif"
+
+    sdate = date(y_st, m_st, d_st)  # start date
+    edate = date(y_en, m_en, d_en)  # end date
+    delta = edate - sdate
+
+    file_list = {"date": [],
+                 "image_10m": [],
+                 "image_20m": [],
+                 "mask_20m": []
+                 }
+    for i in range(delta.days + 1):
+        day = sdate + timedelta(days=i)
+        s_day = day.strftime("%Y%m%d")  # make date into string
+        s_year = day.strftime("%Y")
+
+        q10m = os.path.join(mdir_10m, s_year, s_day + "*")
+        q20m = os.path.join(mdir_20m, s_year, s_day + "*")
+
+        dirs10m = glob.glob(q10m)
+        dirs20m = glob.glob(q20m)
+
+        if dirs10m is None:
+            dirs10m = []
+        if dirs20m is None:
+            dirs20m = []
+
+        dirs10m.sort()
+        dirs20m.sort()
+
+        if len(dirs10m) == len(dirs20m) and len(dirs10m) == 0:
+            continue
+        # TODO: Change this part to report which images are missing (LOG?)
+        # elif len(dirs10m) == len(dirs20m) and len(dirs10m) == 1:
+        #     chk1 = os.path.split(dirs10m[0])[1][:-4]
+        #     chk2 = os.path.split(dirs20m[0])[1][:-4]
+        #     if not(chk1 == chk2):
+        #         raise Exception(f"Different 10m and 20m filename for date {s_day}")
+        elif len(dirs10m) == len(dirs20m) and len(dirs10m) > 0:
+            #
+            chk1 = [basename(dirname(k))[:-3] for k in dirs10m]
+            chk2 = [basename(dirname(k))[:-3] for k in dirs20m]
+            if not (chk1 == chk2):
+                raise Exception(f"Different 10m and 20m filenames for date {s_day}")
+        elif len(dirs10m) > len(dirs20m):
+            raise Exception(f"Filename {s_day} missing in 20m resolution")
+        else:
+            raise Exception(f"File {s_day} missing in 10m resolution")
+
+        for dir10, dir20 in zip(dirs10m, dirs20m):
+            q_i10 = os.path.join(dir10, sfx_img)
+            q_i20 = os.path.join(dir20, sfx_img)
+            q_m20 = os.path.join(dir20, sfx_msk)
+
+            pth_i10 = glob.glob(q_i10)[0]
+            pth_i20 = glob.glob(q_i20)[0]
+            pth_m20 = glob.glob(q_m20)[0]
+
+            file_list["date"].append(s_day)
+            file_list["image_10m"].append(pth_i10)
+            file_list["image_20m"].append(pth_i20)
+            file_list["mask_20m"].append(pth_m20)
+
+    df_paths = pd.DataFrame(file_list)
+
+    return df_paths
 
 
 def round_multiple(nr, xL, pix):
@@ -314,7 +405,6 @@ def image_offset(out_ext, src_ds):
     return rd_win, slicex, slicey
 
 
-# ============================================================================
 def composite(src_fps, save_loc, save_nam,
               method="median", comp_mask="all_bad", bbox=None):
 
@@ -489,7 +579,7 @@ def composite(src_fps, save_loc, save_nam,
         print('--- Total time: %s seconds --- \n' % (tTim_B - tTim_A))
 
     # ----------------------------------------------------------------------------
-    # OUT OF THE COMPOSITE LOOP RESTORE SAVED FILES AND BUIL TIF
+    # OUT OF THE COMPOSITE LOOP RESTORE SAVED FILES AND BUILD TIF
     # ----------------------------------------------------------------------------
     if nr_bands > 1:
 
@@ -554,55 +644,220 @@ def composite(src_fps, save_loc, save_nam,
     print('\n--- Total time: %s seconds --- \n' % (tTim_B - tTim_A))
 
 
-# ========================================================================
-# TEMPORARY INPUT
-# ========================================================================
-# Select from: mean, median, max, min
-method = 'median'
-comp_mask = 'all_bad'
+def initiate_log(save_dir, inputs):
+    log_nam = "LOG.txt"
+    log_pth = os.path.join(save_dir, log_nam)
+    logging.basicConfig(filename=log_pth,
+                        format='%(asctime)s - %(levelname)s - %(message)s',
+                        level=logging.INFO)
+    logging.getLogger("rasterio").setLevel(logging.ERROR)
+    with open(log_pth, "w") as dest:
+        dest.write("#" * 36
+                   + "\n# Log of S-2 compositing algorithm #\n"
+                   + "#" * 36 + "\n" * 2)
+        current_time = datetime.now()
+        dest.write("Time started: ")
+        dest.write(current_time.strftime("%a, %d %b %Y %H:%M:%S\n"))
+        dest.write("\nInputs:\n" + "=" * 26 + "\n")
 
-save_loc = "."
-save_nam = "20202102_test_02"
 
-bbox = None
-#        # xL    # yD    # xR    # yU
-bbox = [348890, 100000, 631610, 140000]
-# bbox_C = [481380, 16390, 631610, 201590]  # E079 IMAGE
-# bbox_D = [348890, 16390, 448580, 201590]  # W022 IMAGE
-# out_extents = [348890, 16390, 631610, 201590]  # C122 IMAGE
 
-file1 = ("E:\\sentinel_composite\\dev_src\\"
-         "20190401T100031_S2A_MSIL2A_20190401T105727_C122_10m\\"
-         "20190401T100031_S2A_MSIL2A_20190401T105727_C122"
-         "_10m__ms_p2atm_d96tm.tif")
+        dest.write("\nCompositing time interval:\n")
+        stin = f"{start_date[2]:02d}-{start_date[1]:02d}-{start_date[0]}"
+        stout = f"{end_date[2]:02d}-{end_date[1]:02d}-{end_date[0]}"
+        dest.write(f"From: {stin}\n")
+        dest.write(f"To:   {stout}\n")
+        dest.write("\nFiltering criteria:\n")
 
-file2 = ('E:\\sentinel_composite\\dev_src\\'
-         '20190406T100029_S2B_MSIL2A_20190406T125021_C122_10m\\'
-         '20190406T100029_S2B_MSIL2A_20190406T125021_C122_10m'
-         '__ms_p2atm_d96tm.tif')
+        if mask_crt == "less_than":
+            dest.write(f"Valid if mask is {mask_thr} or greater\n")
+        elif mask_crt == "all_bad":
+            dest.write(f"Valid if mask equals {mask_thr}\n")
+        else:
+            dest.write(f"{mask_crt} {mask_thr}\n")
 
-file3 = ('E:\\sentinel_composite\\dev_src\\'
-         '20190403T095029_S2B_MSIL2A_20190403T115455_E079_10m/'
-         '20190403T095029_S2B_MSIL2A_20190403T115455_E079_10m'
-         '__ms_p2atm_d96tm.tif')
+        dest.write("\nSelected spatial resolution:\n")
+        dest.write(resolution + "\n" * 2)
 
-file4 = ('E:\\sentinel_composite\\dev_src\\'
-         '20190404T101031_S2A_MSIL2A_20190404T185546_W022_10m\\'
-         '20190404T101031_S2A_MSIL2A_20190404T185546_W022_10m'
-         '__ms_p2atm_d96tm.tif')
+    return log_pth
 
-file5 = ('E:\\sentinel_composite\\dev_src\\'
-         '20190408T095031_S2A_MSIL2A_20190408T102633_E079_10m\\'
-         '20190408T095031_S2A_MSIL2A_20190408T102633_E079_10m'
-         '__ms_p2atm_d96tm.tif')
 
-file6 = ('E:\\sentinel_composite\\dev_src\\'
-         '20190409T101029_S2B_MSIL2A_20190409T130030_W022_10m\\'
-         '20190409T101029_S2B_MSIL2A_20190409T130030_W022_10m'
-         '__ms_p2atm_d96tm.tif')
+def loop_images(bbox, resolution, files):
+    debug_paths = pickle.load(open(".\\pickled_paths.p", "rb"))
 
-# List of paths to input files
-src_fps = [file1, file2, file3, file4, file5, file6]
-# ========================================================================
-# RUN
-composite(src_fps, save_loc, save_nam, method, comp_mask, bbox)
+    for _, product in debug_paths.iterrows():
+        print(product)
+        files_20m = (product.image_20m, product.mask_20m)
+        if resolution == "10m":
+            file_10m = product.image_10m
+        else:
+            file_10m = None
+
+        paths = [files_20m, file_10m]
+
+        prepare_image(bbox, resolution, [files_20m, file_10m])
+
+        # appendaj nove poti v obstojeci DF
+
+def prepare_image(bbox, resolution, files):
+
+
+    # files - this variable should contain paths to 20m and 10m tiffs+masks
+    tiff_20, mask_20, tiff_10, mask_10 = files
+
+    # Create nobs and nok statistics
+
+    dontknow = bbox
+    # TODO: Apply cloud mask - set clouds to np.nan
+
+    # TODO: Check isSnow
+
+    # TODO: Warp to extents
+
+    # TODO: save to local SDD
+
+    # TODO: if compositing 10m, resample to nearest neighbour?
+    if resolution == 10:
+        pass
+        # TODO: Resample 20m to 10m
+        # Ko resamplaš ustvari nov file z 13 bandi
+        # Tiles on
+    path_to_image= []
+
+    return path_to_image
+
+
+def main(
+        start_date, end_date, bbox, resolution,
+        mask_thr=41, mask_crt="less_than", medoid_distance="euler",
+        save_loc="./temp_out", log=False, test_case=False):
+    """Creates an S-2 composite for the given time period and geographical
+    extents.
+
+    Parameters
+    ----------
+    start_date
+    end_date
+    bbox
+    resolution
+    mask_thr
+    mask_crt
+    medoid_distance
+    save_loc
+    log
+    test_case
+
+    Returns
+    -------
+
+    """
+    time_a = time.time()
+
+    # Pack inputs to a dictionary
+    ins = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "output_extents": bbox,
+        "pixel_size": resolution,
+        "mask_threshold": mask_thr,
+        "mask_criteria": mask_crt,
+        "medoid_distance": medoid_distance,
+        "save_location": save_loc
+    }
+
+    # Create output folder (sub-folder in the out_dir)
+    frst = f"{start_date[0]}{start_date[1]:02d}{start_date[2]:02d}"
+    last = f"{end_date[0]}{end_date[1]:02d}{end_date[2]:02d}"
+    save_nam = frst + "_" + last + "_" + resolution
+    save_dir = os.path.join(save_loc, save_nam)
+    ins["output_folder"] = save_dir
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Initialize LOG FILE (including all input information)
+    if log:
+        initiate_log(save_dir, ins)
+
+
+    # TODO: FIND PATHS - create data frames, also include columns for date, range of available pixels
+    # --> when creating the list above, determine indexes of array limits based on the overall extent
+
+    # Get extents of the output image
+    # -------------------------------
+    if resolution == "10m":
+        main_extents = output_image_extent(df_inputs['image_10m'], bbox)  # TODO: CHANGE TO TEMP
+    elif resolution == "20m":
+        main_extents = output_image_extent(df_inputs['image_20m'], bbox)
+    else:
+        raise Exception(f"Value  {resolution}  is not valid resolution.")
+
+    # TODO: Prepare images
+    # Loop the list (or DF)
+
+    # TODO: Make composite
+
+    # TODO: SAVE TO TIFF
+
+    # TODO: Create JPEG preview file
+
+    # TODO: Remove temp files
+
+    time_a = time.time() - time_a
+    print(f"Duration of main() execution: {time_a:.2f} sec")
+    print(f"[ {round(time_a / 60)} min ]")
+
+
+if __name__ == "__main__":
+    main(,
+
+    # Select from: mean, median, max, min
+    # method = 'median'
+    # comp_mask = 'all_bad'
+    #
+    # save_loc = "."
+    # save_nam = "20202102_test_02"
+    #
+    # in_pix_size = 10  # 10 m or 20 m
+    #
+    # # TODO: If bbox is None, use the combined extent of all images
+    # bbox = None
+    # #        # xL    # yD    # xR    # yU
+    # bbox = [348890, 100000, 631610, 140000]
+    # # bbox_C = [481380, 16390, 631610, 201590]  # E079 IMAGE
+    # # bbox_D = [348890, 16390, 448580, 201590]  # W022 IMAGE
+    # # out_extents = [348890, 16390, 631610, 201590]  # C122 IMAGE
+    #
+    # file1 = ("E:\\sentinel_composite\\dev_src\\"
+    #          "20190401T100031_S2A_MSIL2A_20190401T105727_C122_10m\\"
+    #          "20190401T100031_S2A_MSIL2A_20190401T105727_C122"
+    #          "_10m__ms_p2atm_d96tm.tif")
+    #
+    # file2 = ('E:\\sentinel_composite\\dev_src\\'
+    #          '20190406T100029_S2B_MSIL2A_20190406T125021_C122_10m\\'
+    #          '20190406T100029_S2B_MSIL2A_20190406T125021_C122_10m'
+    #          '__ms_p2atm_d96tm.tif')
+    #
+    # file3 = ('E:\\sentinel_composite\\dev_src\\'
+    #          '20190403T095029_S2B_MSIL2A_20190403T115455_E079_10m/'
+    #          '20190403T095029_S2B_MSIL2A_20190403T115455_E079_10m'
+    #          '__ms_p2atm_d96tm.tif')
+    #
+    # file4 = ('E:\\sentinel_composite\\dev_src\\'
+    #          '20190404T101031_S2A_MSIL2A_20190404T185546_W022_10m\\'
+    #          '20190404T101031_S2A_MSIL2A_20190404T185546_W022_10m'
+    #          '__ms_p2atm_d96tm.tif')
+    #
+    # file5 = ('E:\\sentinel_composite\\dev_src\\'
+    #          '20190408T095031_S2A_MSIL2A_20190408T102633_E079_10m\\'
+    #          '20190408T095031_S2A_MSIL2A_20190408T102633_E079_10m'
+    #          '__ms_p2atm_d96tm.tif')
+    #
+    # file6 = ('E:\\sentinel_composite\\dev_src\\'
+    #          '20190409T101029_S2B_MSIL2A_20190409T130030_W022_10m\\'
+    #          '20190409T101029_S2B_MSIL2A_20190409T130030_W022_10m'
+    #          '__ms_p2atm_d96tm.tif')
+    #
+    # # List of paths to input files
+    # src_fps = [file1, file2, file3, file4, file5, file6]
+    # # ========================================================================
+    # # RUN
+    # composite(src_fps, save_loc, save_nam, method, comp_mask, bbox)
